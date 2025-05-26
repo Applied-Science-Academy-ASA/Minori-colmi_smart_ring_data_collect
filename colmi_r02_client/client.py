@@ -135,7 +135,7 @@ class Client:
         import asyncio
         import sys
         import threading
-        
+        print(reading_type)
         start_packet = real_time.get_start_packet(reading_type)
         stop_packet = real_time.get_stop_packet(reading_type)
 
@@ -171,11 +171,22 @@ class Client:
         keyboard_thread.start()
         
         try:
+            data_count = 0
+            last_data_time = asyncio.get_event_loop().time()
+            
             while not stopping:
                 try:
+                    # Resend start packet every 10 readings or if no data for 5 seconds
+                    current_time = asyncio.get_event_loop().time()
+                    if data_count >= 10 or (current_time - last_data_time > 5):
+                        logger.info("Resending start packet to keep data flowing...")
+                        await self.send_packet(start_packet)
+                        data_count = 0
+                        last_data_time = current_time
+                    
                     data: real_time.Reading | real_time.ReadingError = await asyncio.wait_for(
                         self.queues[real_time.CMD_START_REAL_TIME].get(),
-                        timeout=0.5,  # Shorter timeout for more responsive stopping
+                        timeout=3,  # Timeout for response
                     )
                     if isinstance(data, real_time.ReadingError):
                         error = True
@@ -183,12 +194,17 @@ class Client:
                     if data.value != 0:
                         valid_readings.append(data.value)
                         print(f"Reading: {data.value}")
+                        data_count += 1
+                        last_data_time = asyncio.get_event_loop().time()
                 except asyncio.TimeoutError:
+                    # If timeout occurs, we'll check if we need to resend in the next loop
                     pass  # Just continue checking stopping flag
         finally:
             stopping = True  # Signal keyboard thread to exit
-
-        await self.send_packet(stop_packet)
+            # Ensure we always send the stop packet
+            await self.send_packet(stop_packet)
+            logger.info(f"Data collection stopped. Collected {len(valid_readings)} readings.")
+            
         if error:
             return None
         return valid_readings
