@@ -178,8 +178,10 @@ class Client:
                 try:
                     # Resend start packet every 10 readings or if no data for 5 seconds
                     current_time = asyncio.get_event_loop().time()
+                    print(f"Current time: {current_time}, last data time: {last_data_time}, data count: {data_count}")
                     if data_count >= 10 or (current_time - last_data_time > 5):
-                        logger.info("Resending start packet to keep data flowing...")
+                        logger.debug(f"Sending packet: {start_packet}")
+                        print(f"Sending packet: {start_packet}")
                         await self.send_packet(start_packet)
                         data_count = 0
                         last_data_time = current_time
