@@ -132,6 +132,10 @@ class Client:
         return result
 
     async def _poll_real_time_reading(self, reading_type: real_time.RealTimeReading) -> list[int] | None:
+        import asyncio
+        import sys
+        import threading
+        
         start_packet = real_time.get_start_packet(reading_type)
         stop_packet = real_time.get_stop_packet(reading_type)
 
@@ -139,20 +143,50 @@ class Client:
 
         valid_readings: list[int] = []
         error = False
-        tries = 0
-        while len(valid_readings) < 6 and tries < 20:
-            try:
-                data: real_time.Reading | real_time.ReadingError = await asyncio.wait_for(
-                    self.queues[real_time.CMD_START_REAL_TIME].get(),
-                    timeout=2,
-                )
-                if isinstance(data, real_time.ReadingError):
-                    error = True
-                    break
-                if data.value != 0:
-                    valid_readings.append(data.value)
-            except TimeoutError:
-                tries += 1
+        stopping = False
+        
+        # Use a separate thread for keyboard monitoring to not block asyncio
+        def check_for_quit():
+            nonlocal stopping
+            print("Press 'q' to stop collecting readings...")
+            while not stopping:
+                if sys.platform == 'win32':
+                    import msvcrt
+                    if msvcrt.kbhit() and msvcrt.getch() == b'q':
+                        print("Stopping data collection...")
+                        stopping = True
+                        break
+                else:
+                    # For Unix-like systems
+                    import select
+                    rlist, _, _ = select.select([sys.stdin], [], [], 0.5)
+                    if rlist and sys.stdin.read(1) == 'q':
+                        print("Stopping data collection...")
+                        stopping = True
+                        break
+                    
+        # Start keyboard monitoring in separate thread
+        keyboard_thread = threading.Thread(target=check_for_quit)
+        keyboard_thread.daemon = True  # Thread will exit when main program exits
+        keyboard_thread.start()
+        
+        try:
+            while not stopping:
+                try:
+                    data: real_time.Reading | real_time.ReadingError = await asyncio.wait_for(
+                        self.queues[real_time.CMD_START_REAL_TIME].get(),
+                        timeout=0.5,  # Shorter timeout for more responsive stopping
+                    )
+                    if isinstance(data, real_time.ReadingError):
+                        error = True
+                        break
+                    if data.value != 0:
+                        valid_readings.append(data.value)
+                        print(f"Reading: {data.value}")
+                except asyncio.TimeoutError:
+                    pass  # Just continue checking stopping flag
+        finally:
+            stopping = True  # Signal keyboard thread to exit
 
         await self.send_packet(stop_packet)
         if error:
