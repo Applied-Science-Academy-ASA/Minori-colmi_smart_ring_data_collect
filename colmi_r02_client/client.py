@@ -132,81 +132,267 @@ class Client:
         return result
 
     async def _poll_real_time_reading(self, reading_type: real_time.RealTimeReading) -> list[int] | None:
+        """
+        Original real-time polling method - commented out
+        """
+        # import asyncio
+        # import sys
+        # import threading
+        # print(reading_type)
+        # start_packet = real_time.get_start_packet(reading_type)
+        # stop_packet = real_time.get_stop_packet(reading_type)
+        # 
+        # await self.send_packet(start_packet)
+        # 
+        # valid_readings: list[int] = []
+        # error = False
+        # stopping = False
+        # 
+        # # Use a separate thread for keyboard monitoring to not block asyncio
+        # def check_for_quit():
+        #     nonlocal stopping
+        #     print("Press 'q' to stop collecting readings...")
+        #     while not stopping:
+        #         if sys.platform == 'win32':
+        #             import msvcrt
+        #             if msvcrt.kbhit() and msvcrt.getch() == b'q':
+        #                 print("Stopping data collection...")
+        #                 stopping = True
+        #                 break
+        #         else:
+        #             # For Unix-like systems
+        #             import select
+        #             rlist, _, _ = select.select([sys.stdin], [], [], 0.5)
+        #             if rlist and sys.stdin.read(1) == 'q':
+        #                 print("Stopping data collection...")
+        #                 stopping = True
+        #                 break
+        #             
+        # # Start keyboard monitoring in separate thread
+        # keyboard_thread = threading.Thread(target=check_for_quit)
+        # keyboard_thread.daemon = True  # Thread will exit when main program exits
+        # keyboard_thread.start()
+        # 
+        # try:
+        #     data_count = 0
+        #     last_data_time = asyncio.get_event_loop().time()
+        #     
+        #     while not stopping:
+        #         try:
+        #             # Resend start packet every 10 readings or if no data for 5 seconds
+        #             current_time = asyncio.get_event_loop().time()
+        #             print(f"Current time: {current_time}, last data time: {last_data_time}, data count: {data_count}")
+        #             if data_count >= 10 or (data_count >= 10 and (current_time - last_data_time > 5)):
+        #                 logger.debug(f"Sending packet: {start_packet}")
+        #                 print(f"Sending packet: {start_packet}")
+        #                 await self.send_packet(start_packet)
+        #                 data_count = 0
+        #                 last_data_time = current_time
+        #             
+        #             data: real_time.Reading | real_time.ReadingError = await asyncio.wait_for(
+        #                 self.queues[real_time.CMD_START_REAL_TIME].get(),
+        #                 timeout=3,  # Timeout for response
+        #             )
+        #             if isinstance(data, real_time.ReadingError):
+        #                 error = True
+        #                 break
+        #             if data.value != 0:
+        #                 valid_readings.append(data.value)
+        #                 print(f"Reading: {data.value}")
+        #                 data_count += 1
+        #                 last_data_time = asyncio.get_event_loop().time()
+        #         except asyncio.TimeoutError:
+        #             # If timeout occurs, we'll check if we need to resend in the next loop
+        #             pass  # Just continue checking stopping flag
+        # finally:
+        #     stopping = True  # Signal keyboard thread to exit
+        #     # Ensure we always send the stop packet
+        #     await self.send_packet(stop_packet)
+        #     logger.info(f"Data collection stopped. Collected {len(valid_readings)} readings.")
+        #     
+        # if error:
+        #     return None
+        # return valid_readings
+
+        # New implementation using Arduino IoT Client
         import asyncio
         import sys
         import threading
-        print(reading_type)
+        import time
+        import os
+        
+        # First, send the start packet to begin data collection
+        print(f"Starting real-time reading for {reading_type}")
         start_packet = real_time.get_start_packet(reading_type)
         stop_packet = real_time.get_stop_packet(reading_type)
-
+        
         await self.send_packet(start_packet)
-
+        
+        # We'll still collect readings locally for return value
         valid_readings: list[int] = []
         error = False
         stopping = False
         
-        # Use a separate thread for keyboard monitoring to not block asyncio
-        def check_for_quit():
-            nonlocal stopping
-            print("Press 'q' to stop collecting readings...")
-            while not stopping:
-                if sys.platform == 'win32':
-                    import msvcrt
-                    if msvcrt.kbhit() and msvcrt.getch() == b'q':
-                        print("Stopping data collection...")
-                        stopping = True
-                        break
-                else:
-                    # For Unix-like systems
-                    import select
-                    rlist, _, _ = select.select([sys.stdin], [], [], 0.5)
-                    if rlist and sys.stdin.read(1) == 'q':
-                        print("Stopping data collection...")
-                        stopping = True
-                        break
-                    
-        # Start keyboard monitoring in separate thread
-        keyboard_thread = threading.Thread(target=check_for_quit)
-        keyboard_thread.daemon = True  # Thread will exit when main program exits
-        keyboard_thread.start()
-        
+                 # To use Arduino IoT Client, we need to set up authentication
         try:
-            data_count = 0
-            last_data_time = asyncio.get_event_loop().time()
+            # Import required libraries for new authentication method
+            from oauthlib.oauth2 import BackendApplicationClient
+            from requests_oauthlib import OAuth2Session
+            import iot_api_client as iot
+            from iot_api_client.exceptions import ApiException
+            from iot_api_client.configuration import Configuration
+            from iot_api_client.api import PropertiesV2Api, ThingsV2Api
             
-            while not stopping:
-                try:
-                    # Resend start packet every 10 readings or if no data for 5 seconds
-                    current_time = asyncio.get_event_loop().time()
-                    print(f"Current time: {current_time}, last data time: {last_data_time}, data count: {data_count}")
-                    if data_count >= 10 or (data_count >= 10 and (current_time - last_data_time > 5)):
-                        logger.debug(f"Sending packet: {start_packet}")
-                        print(f"Sending packet: {start_packet}")
-                        await self.send_packet(start_packet)
-                        data_count = 0
-                        last_data_time = current_time
+            # Setup for stopping via keyboard
+            def check_for_quit():
+                nonlocal stopping
+                print("Press 'q' to stop collecting readings...")
+                while not stopping:
+                    if sys.platform == 'win32':
+                        import msvcrt
+                        if msvcrt.kbhit() and msvcrt.getch() == b'q':
+                            print("Stopping data collection...")
+                            stopping = True
+                            break
+                    else:
+                        # For Unix-like systems
+                        import select
+                        rlist, _, _ = select.select([sys.stdin], [], [], 0.5)
+                        if rlist and sys.stdin.read(1) == 'q':
+                            print("Stopping data collection...")
+                            stopping = True
+                            break
+            
+            # Start keyboard monitoring in separate thread
+            keyboard_thread = threading.Thread(target=check_for_quit)
+            keyboard_thread.daemon = True
+            keyboard_thread.start()
+            
+            # You'll need to set these with your actual Arduino IoT credentials
+            # Ideally these should come from environment variables or a secure config
+            client_id = os.environ.get("ARDUINO_CLIENT_ID_SLEEPMONITOR_MINORI")
+            client_secret = os.environ.get("ARDUINO_CLIENT_SECRET_SLEEPMONITOR_MINORI")
+            # thing_id = os.environ.get("ARDUINO_THING_ID_SLEEPMONITOR_MINORI")
+            # property_id = os.environ.get("ARDUINO_PROPERTY_ID_SLEEPMONITOR_MINORI")
+            # org_id = os.environ.get("ARDUINO_ORG_ID_SLEEPMONITOR_MINORI")  # Optional organization ID
+            org_id = False
+
+            # if not all([client_id, client_secret, thing_id, property_id]):
+            #     logger.error("Arduino IoT credentials not provided. Please set environment variables: "
+            #                 "ARDUINO_CLIENT_ID_SLEEPMONITOR_MINORI, ARDUINO_CLIENT_SECRET_SLEEPMONITOR_MINORI, "
+            #                 "ARDUINO_THING_ID_SLEEPMONITOR_MINORI, ARDUINO_PROPERTY_ID_SLEEPMONITOR_MINORI")
+            #     error = True
+            #     return None
+            
+            # Get an OAuth2 token using the new method
+            logger.info("Getting OAuth2 token for Arduino IoT Cloud...")
+            oauth_client = BackendApplicationClient(client_id=client_id)
+            token_url = "https://api2.arduino.cc/iot/v1/clients/token"
+            
+            oauth = OAuth2Session(client=oauth_client)
+            
+            # Include organization ID if available
+            if org_id:
+                token = oauth.fetch_token(
+                    token_url=token_url,
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    include_client_id=True,
+                    audience="https://api2.arduino.cc/iot",
+                    headers={"X-Organization": org_id}
+                )
+            else:
+                token = oauth.fetch_token(
+                    token_url=token_url,
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    include_client_id=True,
+                    audience="https://api2.arduino.cc/iot"
+                )
+            
+            access_token = token.get("access_token")
+            logger.info("Successfully obtained Arduino IoT Cloud access token")
+            
+            # Configure API client with the token
+            client_config = Configuration(host="https://api2.arduino.cc/iot")
+            client_config.access_token = access_token
+            
+            # Create API client with organization ID if available
+            if org_id:
+                api_client = iot.ApiClient(client_config, header_name="X-Organization", header_value=org_id)
+            else:
+                api_client = iot.ApiClient(client_config)
+            
+            # Initialize APIs with the new client
+            properties_api = PropertiesV2Api(api_client)
+            things_api = ThingsV2Api(api_client)
+            
+            try:
+                # Main data collection loop
+                while not stopping:
+                    try:
+                        # Get data from the device
+                        data: real_time.Reading | real_time.ReadingError = await asyncio.wait_for(
+                            self.queues[real_time.CMD_START_REAL_TIME].get(),
+                            timeout=3,
+                        )
+                        
+                        if isinstance(data, real_time.ReadingError):
+                            error = True
+                            break
+                            
+                        if data.value != 0:
+                            # Store the reading locally
+                            valid_readings.append(data.value)
+                            print(f"Reading: {data.value}")
+                            
+                            # Send data to Arduino IoT Cloud
+                            try:
+                                # Arduino IoT Cloud expects specific format for property publishing
+                                timestamp = int(time.time() * 1000)
+                                # Format may vary based on the property type; adjust as needed
+                                value = data.value
+                                
+                                Using the new API format for publishing property values
+                                # if org_id:
+                                    org_id = Falseprope
+                                    rties_api.properties_v2_publish(
+                                #         id=property_id, 
+                                #         # property_value=value,
+                                #         # x_organization=org_id
+                                #     org_id = False)
+
+                                # else:
+                                #     properties_api.properties_v2_publish(
+                                #         id=property_id, 
+                                #         property_value=value
+                                #     )
+                                    
+                                logger.info(f"Sent value {data.value} to Arduino IoT Cloud")
+                            except ApiException as e:
+                                logger.error(f"API error sending data to Arduino IoT Cloud: {e}")
+                            except Exception as e:
+                                logger.error(f"Error sending data to Arduino IoT Cloud: {e}")
                     
-                    data: real_time.Reading | real_time.ReadingError = await asyncio.wait_for(
-                        self.queues[real_time.CMD_START_REAL_TIME].get(),
-                        timeout=3,  # Timeout for response
-                    )
-                    if isinstance(data, real_time.ReadingError):
-                        error = True
-                        break
-                    if data.value != 0:
-                        valid_readings.append(data.value)
-                        print(f"Reading: {data.value}")
-                        data_count += 1
-                        last_data_time = asyncio.get_event_loop().time()
-                except asyncio.TimeoutError:
-                    # If timeout occurs, we'll check if we need to resend in the next loop
-                    pass  # Just continue checking stopping flag
+                    except asyncio.TimeoutError:
+                        # If we time out waiting for data, check if we're stopping
+                        pass
+                        
+            except Exception as e:
+                logger.error(f"Error in Arduino IoT data collection: {e}")
+                error = True
+                
+        except ImportError as ie:
+            logger.error(f"Required packages not installed: {ie}")
+            logger.error("Install required packages with: pip install requests-oauthlib iot-api-client")
+            error = True
+        
         finally:
-            stopping = True  # Signal keyboard thread to exit
-            # Ensure we always send the stop packet
+            # Always stop data collection and cleanup
+            stopping = True
             await self.send_packet(stop_packet)
             logger.info(f"Data collection stopped. Collected {len(valid_readings)} readings.")
-            
+        
         if error:
             return None
         return valid_readings
