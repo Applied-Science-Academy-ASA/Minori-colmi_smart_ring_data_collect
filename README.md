@@ -66,7 +66,7 @@ You can get it on [here on AliExpress](https://www.aliexpress.com/item/100500663
 If you don't know python that well, I **highly** recommend you install [pipx](https://pipx.pypa.io/stable/installation/). It's purpose built for managing python packages intended to be used as standalone programs and it will keep your computer safe from the pitfalls of python packaging. Once installed you can do
 
 ```sh
-pipx install git+https://github.com/tahnok/colmi_r02_client
+pipx install git+https://github.com/Applied-Science-Academy-ASA/Minori-colmi_smart_ring_data_collect
 ```
 
 Once that is done you can look for nearby rings using

@@ -353,10 +353,9 @@ class Client:
                                 # Format may vary based on the property type; adjust as needed
                                 value = data.value
                                 
-                                Using the new API format for publishing property values
+                                # Using the new API format for publishing property values
                                 # if org_id:
-                                    org_id = Falseprope
-                                    rties_api.properties_v2_publish(
+                                #     org_id = Falseproperties_api.properties_v2_publish(
                                 #         id=property_id, 
                                 #         # property_value=value,
                                 #         # x_organization=org_id
