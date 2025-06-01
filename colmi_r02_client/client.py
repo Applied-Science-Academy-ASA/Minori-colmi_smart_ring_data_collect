@@ -5,12 +5,15 @@ from dataclasses import dataclass
 import logging
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import Any, Optional
 import json
+import sys
 
 from bleak import BleakClient
 from bleak.backends.characteristic import BleakGATTCharacteristic
 import paho.mqtt.client as mqtt
+import serial
+import serial.tools.list_ports
 
 from colmi_r02_client import battery, date_utils, steps, set_time, blink_twice, hr, hr_settings, packet, reboot, real_time
 
@@ -63,19 +66,80 @@ multi packet messages where the parser has state
 
 
 class Client:
-    def __init__(self, address: str, record_to: Path | None = None, use_mqtt: bool = True):
+    def __init__(self, address: str, record_to: Path | None = None, use_mqtt: bool = True, serial_port: Optional[str] = None, baud_rate: int = 9600):
         self.address = address
         self.bleak_client = BleakClient(self.address)
         self.queues: dict[int, asyncio.Queue] = {cmd: asyncio.Queue() for cmd in COMMAND_HANDLERS}
         self.record_to = record_to
         
+        # Serial port setup
+        self.serial_port = serial_port
+        self.serial_conn = None
+        if serial_port:
+            try:
+                self.serial_conn = serial.Serial(serial_port, baud_rate, timeout=1)
+                logger.info(f"Connected to serial port {serial_port} at {baud_rate} baud")
+                print(f"Connected to serial port {serial_port} at {baud_rate} baud")
+            except serial.SerialException as e:
+                logger.error(f"Failed to connect to serial port {serial_port}: {e}")
+                print(f"Failed to connect to serial port {serial_port}: {e}")
+        
         # MQTT setup
         self.use_mqtt = use_mqtt
         if use_mqtt:
             self.mqtt_client = mqtt.Client()
+            
+            # Define MQTT callbacks
+            self.mqtt_client.on_connect = self._on_mqtt_connect
+            self.mqtt_client.on_message = self._on_mqtt_message
+            
+            # Connect to the broker
             self.mqtt_client.connect("server.nikolaacademy.com", 1883, 60)
             self.mqtt_client.loop_start()
             logger.info("Connected to MQTT broker")
+
+    # MQTT callback for when the client connects to the broker
+    def _on_mqtt_connect(self, client, userdata, flags, rc):
+        logger.info(f"Connected to MQTT broker with result code {rc}")
+        # Subscribe to topics (including the blanket sensors topic)
+        client.subscribe("minori-blanket-sensors")
+        logger.info("Subscribed to minori-blanket-sensors topic")
+    
+    # MQTT callback for when a message is received
+    def _on_mqtt_message(self, client, userdata, msg):
+        try:
+            payload = msg.payload.decode()
+            logger.info(f"Received MQTT message from topic {msg.topic}: {payload}")
+            
+            # Send to serial port if connected
+            if self.serial_conn and self.serial_conn.is_open and msg.topic == "minori-blanket-sensors":
+                try:
+                    # Add a newline for better serial reading
+                    self.serial_conn.write((payload + '\n').encode())
+                    logger.debug(f"Sent to serial port: {payload}")
+                except Exception as e:
+                    logger.error(f"Failed to send to serial port: {e}")
+            
+            # Format display based on the topic
+            if msg.topic == "minori-blanket-sensors":
+                try:
+                    # Try to parse as JSON if it's in that format
+                    data = json.loads(payload)
+                    print("\n===== BLANKET SENSOR DATA =====")
+                    if isinstance(data, dict):
+                        for key, value in data.items():
+                            print(f"  {key}: {value}")
+                    else:
+                        print(f"  Value: {data}")
+                    print("===============================\n")
+                except json.JSONDecodeError:
+                    # If not JSON, just print the raw data
+                    print(f"\n===== BLANKET SENSOR DATA =====\n  {payload}\n===============================\n")
+            else:
+                # For other topics
+                print(f"MQTT [{msg.topic}]: {payload}")
+        except Exception as e:
+            logger.error(f"Error processing MQTT message: {e}")
 
     async def __aenter__(self) -> "Client":
         logger.info(f"Connecting to {self.address}")
@@ -98,6 +162,11 @@ class Client:
             self.mqtt_client.loop_stop()
             self.mqtt_client.disconnect()
             logger.info("Disconnected from MQTT broker")
+        
+        # Close serial port if open
+        if self.serial_conn and self.serial_conn.is_open:
+            self.serial_conn.close()
+            logger.info("Closed serial port connection")
             
         await self.disconnect()
 
@@ -154,7 +223,6 @@ class Client:
 
     async def _poll_real_time_reading(self, reading_type: real_time.RealTimeReading) -> None:
         import asyncio
-        import sys
         import threading
         
         start_packet = real_time.get_start_packet(reading_type)
@@ -225,21 +293,8 @@ class Client:
                         
                         # Publish to MQTT if enabled
                         if self.use_mqtt:
-                            timestamp = datetime.now().isoformat()
-                            mqtt_payload = json.dumps({
-                                "timestamp": timestamp,
-                                "device": {
-                                    "address": self.address,
-                                    "type": "Colmi Smart Ring",
-                                },
-                                "sensor": {
-                                    "type": str(reading_type),
-                                    "value": data.value,
-                                    "unit": "bpm" if reading_type == real_time.RealTimeReading.HEART_RATE else "unknown"
-                                }
-                            })
-                            self.mqtt_client.publish("colmi-heart-sensor", mqtt_payload)
-                            logger.debug(f"Published to MQTT: {mqtt_payload}")
+                            self.mqtt_client.publish("colmi-heart-sensor", data.value)
+                            logger.debug(f"Published to MQTT: {data.value}")
                         
                         data_count += 1
                         last_data_time = asyncio.get_event_loop().time()
@@ -353,3 +408,29 @@ class Client:
             sport_detail_logs.append(await self.get_steps(d))
 
         return FullData(self.address, heart_rates=heart_rate_logs, sport_details=sport_detail_logs)
+
+# Add a helper function at the end of the file to select a serial port
+def select_serial_port():
+    ports = list(serial.tools.list_ports.comports())
+    if not ports:
+        print("No serial ports available.")
+        return None
+    
+    print("\nAvailable serial ports:")
+    for i, port in enumerate(ports):
+        print(f"{i+1}. {port.device}: {port.description}")
+    
+    choice = input("\nSelect a port (number) or press Enter to skip: ")
+    if not choice.strip():
+        return None
+    
+    try:
+        index = int(choice) - 1
+        if 0 <= index < len(ports):
+            return ports[index].device
+        else:
+            print("Invalid selection.")
+            return select_serial_port()
+    except ValueError:
+        print("Please enter a number.")
+        return select_serial_port()
