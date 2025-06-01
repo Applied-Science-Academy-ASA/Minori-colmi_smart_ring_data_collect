@@ -67,6 +67,29 @@ files = [
     {file = "bleak-0.22.3.tar.gz", hash = "sha256:3149c3c19657e457727aa53d9d6aeb89658495822cd240afd8aeca4dd09c045c"},
 ]
 
+[[package]]
+name = "oauthlib"
+version = "3.2.2"
+description = "OAuthlib is a generic, spec-compliant, thorough implementation of the OAuth request-signing logic"
+optional = false
+python-versions = ">=3.7"
+files = [
+    {file = "oauthlib-3.2.2-py3-none-any.whl", hash = "sha256:1e62a9f5e0c184826e6c906e341d8aca53793e4596eeaf4e0b191e7aca5c461c"},
+    {file = "oauthlib-3.2.2.tar.gz", hash = "sha256:3149c3c19657e457727aa53d9d6aeb89658495822cd240afd8aeca4dd09c045c"},
+]
+
+[[package]]
+name = "requests-oauthlib"
+version = "1.3.1"
+description = "OAuthlib authentication support for Requests"
+optional = false
+python-versions = ">=3.7"
+files = [
+    {file = "requests_oauthlib-1.3.1-py3-none-any.whl", hash = "sha256:1e62a9f5e0c184826e6c906e341d8aca53793e4596eeaf4e0b191e7aca5c461c"},
+    {file = "requests_oauthlib-1.3.1.tar.gz", hash = "sha256:3149c3c19657e457727aa53d9d6aeb89658495822cd240afd8aeca4dd09c045c"},
+]
+
+
 [package.dependencies]
 bleak-winrt = {version = ">=1.2.0,<2.0.0", markers = "platform_system == \"Windows\" and python_version < \"3.12\""}
 dbus-fast = {version = ">=1.83.0,<3", markers = "platform_system == \"Linux\""}
