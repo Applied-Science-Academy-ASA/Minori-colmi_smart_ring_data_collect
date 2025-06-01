@@ -8,6 +8,7 @@ from types import TracebackType
 from typing import Any, Optional
 import json
 import sys
+import threading
 
 from bleak import BleakClient
 from bleak.backends.characteristic import BleakGATTCharacteristic
@@ -16,6 +17,7 @@ import serial
 import serial.tools.list_ports
 
 from colmi_r02_client import battery, date_utils, steps, set_time, blink_twice, hr, hr_settings, packet, reboot, real_time
+from colmi_r02_client.visualization import SensorDataVisualizer
 
 UART_SERVICE_UUID = "6E40FFF0-B5A3-F393-E0A9-E50E24DCCA9E"
 UART_RX_CHAR_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -66,11 +68,16 @@ multi packet messages where the parser has state
 
 
 class Client:
-    def __init__(self, address: str, record_to: Path | None = None, use_mqtt: bool = True, serial_port: Optional[str] = None, baud_rate: int = 9600):
+    def __init__(self, address: str, record_to: Path | None = None, use_mqtt: bool = True, 
+                 serial_port: Optional[str] = "COM4", baud_rate: int = 115200,
+                 use_visualization: bool = True):
         self.address = address
         self.bleak_client = BleakClient(self.address)
         self.queues: dict[int, asyncio.Queue] = {cmd: asyncio.Queue() for cmd in COMMAND_HANDLERS}
         self.record_to = record_to
+        
+        # Track the latest heart rate reading
+        self.latest_heart_rate = None
         
         # Serial port setup
         self.serial_port = serial_port
@@ -83,6 +90,17 @@ class Client:
             except serial.SerialException as e:
                 logger.error(f"Failed to connect to serial port {serial_port}: {e}")
                 print(f"Failed to connect to serial port {serial_port}: {e}")
+        
+        # Visualization setup
+        self.use_visualization = use_visualization
+        self.visualizer = None
+        if use_visualization:
+            self.visualizer = SensorDataVisualizer()
+            # Start visualization in a separate thread
+            self.viz_thread = threading.Thread(target=self._start_visualization)
+            self.viz_thread.daemon = True
+            self.viz_thread.start()
+            logger.info("Started visualization")
         
         # MQTT setup
         self.use_mqtt = use_mqtt
@@ -98,6 +116,11 @@ class Client:
             self.mqtt_client.loop_start()
             logger.info("Connected to MQTT broker")
 
+    def _start_visualization(self):
+        """Start the visualization in a separate thread."""
+        if self.visualizer:
+            self.visualizer.start()
+
     # MQTT callback for when the client connects to the broker
     def _on_mqtt_connect(self, client, userdata, flags, rc):
         logger.info(f"Connected to MQTT broker with result code {rc}")
@@ -111,10 +134,48 @@ class Client:
             payload = msg.payload.decode()
             logger.info(f"Received MQTT message from topic {msg.topic}: {payload}")
             
+            # Add heart rate to blanket sensor data if available
+            if msg.topic == "minori-blanket-sensors" and self.latest_heart_rate is not None:
+                try:
+                    # Parse the JSON
+                    data = json.loads(payload)
+                    
+                    # Add heart rate to the data
+                    data["heartrate"] = self.latest_heart_rate
+                    
+                    # Convert back to JSON
+                    enhanced_payload = json.dumps(data)
+                    logger.info(f"Added heart rate to blanket sensor data: {enhanced_payload}")
+                    print(f"Added heart rate to blanket sensor data: {enhanced_payload}")
+                    
+                    # Update visualization if enabled
+                    if self.visualizer:
+                        self.visualizer.update_data(data)
+                    
+                    # Send the enhanced data to serial port if connected
+                    if self.serial_conn and self.serial_conn.is_open:
+                        try:
+                            self.serial_conn.write((enhanced_payload + '\n').encode())
+                            logger.debug(f"Sent to serial port: {enhanced_payload}")
+                        except Exception as e:
+                            logger.error(f"Failed to send to serial port: {e}")
+                    
+                    # Format display based on the topic
+                    print("\n===== ENHANCED SENSOR DATA =====")
+                    for key, value in data.items():
+                        print(f"  {key}: {value}")
+                    print("===============================\n")
+                    
+                    # Return early since we've handled the message
+                    return
+                except json.JSONDecodeError:
+                    # If not JSON, fall back to standard handling
+                    logger.warning("Failed to parse blanket sensor data as JSON")
+            
+            # Original handling for non-JSON or other topics
             # Send to serial port if connected
             if self.serial_conn and self.serial_conn.is_open and msg.topic == "minori-blanket-sensors":
                 try:
-                    # Add a newline for better serial reading
                     self.serial_conn.write((payload + '\n').encode())
                     logger.debug(f"Sent to serial port: {payload}")
                 except Exception as e:
@@ -162,6 +223,11 @@ class Client:
             self.mqtt_client.loop_stop()
             self.mqtt_client.disconnect()
             logger.info("Disconnected from MQTT broker")
+        
+        # Stop visualization if enabled
+        if self.visualizer:
+            self.visualizer.stop()
+            logger.info("Stopped visualization")
         
         # Close serial port if open
         if self.serial_conn and self.serial_conn.is_open:
@@ -291,10 +357,9 @@ class Client:
                         # valid_readings.append(data.value)
                         print(f"Reading: {data.value}")
                         
-                        # Publish to MQTT if enabled
-                        if self.use_mqtt:
-                            self.mqtt_client.publish("colmi-heart-sensor", data.value)
-                            logger.debug(f"Published to MQTT: {data.value}")
+                        # Instead of publishing to a separate topic, we'll modify the blanket sensor data
+                        # Store the latest heart rate value to be added to blanket sensor data
+                        self.latest_heart_rate = data.value
                         
                         data_count += 1
                         last_data_time = asyncio.get_event_loop().time()

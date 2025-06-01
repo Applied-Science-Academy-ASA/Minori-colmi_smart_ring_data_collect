@@ -12,6 +12,8 @@ asyncclick = "^8.1.7.2"
 sqlalchemy = "^2.0.36"
 paho-mqtt = "^2.1.0"
 pyserial = "^3.5.0"
+matplotlib = "^3.10.1"
+
 
 [tool.poetry.scripts]
 colmi_r02_client = "colmi_r02_client.cli:cli_client"

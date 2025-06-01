@@ -96,6 +96,7 @@ Once you have your address you can use it to do things like get real time heart 
 
 ```sh
 colmi_r02_client --address=2A:BF:AB:80:C8:7D get-real-time heart-rate
+colmi_r02_client --address=2A:BF:AB:80:C8:7D info
 ```
 
 ```
