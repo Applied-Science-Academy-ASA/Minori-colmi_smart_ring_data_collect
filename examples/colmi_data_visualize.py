@@ -18,6 +18,8 @@ Usage:
 import asyncio
 import sys
 import logging
+import threading
+import time
 from pathlib import Path
 
 from colmi_r02_client.client import Client, select_serial_port
@@ -30,7 +32,67 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-async def main():
+# Global flag to control the heartbeat monitor
+monitoring_active = False
+
+async def monitor_heartbeat(client):
+    """Monitor the heart rate in a separate coroutine."""
+    global monitoring_active
+    monitoring_active = True
+    try:
+        logger.info("Starting heart rate monitoring...")
+        print("Starting real-time heart rate monitoring.")
+        print("Heart rate data will be integrated with blanket sensor data from MQTT.")
+        print("Press 'q' to stop monitoring...")
+        await client.get_realtime_reading(RealTimeReading.HEART_RATE)
+    finally:
+        monitoring_active = False
+        logger.info("Heart rate monitoring stopped")
+
+async def setup_client(device_address, serial_port, record_file):
+    """Set up and initialize the client."""
+    logger.info(f"Connecting to device {device_address}...")
+    client = Client(
+        address=device_address,
+        record_to=record_file,
+        use_mqtt=True,
+        serial_port=serial_port,
+        use_visualization=True
+    )
+    
+    await client.connect()
+    logger.info("Client connected")
+    
+    # Get device info
+    device_info = await client.get_device_info()
+    print(f"Connected to device: {device_info}")
+    
+    # Get battery info
+    battery_info = await client.get_battery()
+    print(f"Battery level: {battery_info.level}%")
+    
+    return client
+
+async def cleanup_client(client):
+    """Clean up and disconnect the client."""
+    logger.info("Disconnecting client...")
+    
+    # Disconnect MQTT if enabled
+    if client.use_mqtt:
+        client.mqtt_client.loop_stop()
+        client.mqtt_client.disconnect()
+        logger.info("Disconnected from MQTT broker")
+    
+    # Close serial port if open
+    if client.serial_conn and client.serial_conn.is_open:
+        client.serial_conn.close()
+        logger.info("Closed serial port connection")
+    
+    await client.disconnect()
+    logger.info("Client disconnected")
+
+def main():
+    """Main entry point for the application."""
     if len(sys.argv) < 2:
         print("Usage: python colmi_data_visualize.py <device_address>")
         return
@@ -46,7 +108,7 @@ async def main():
     output_dir.mkdir(exist_ok=True)
     
     # Specify a file to record raw data (optional)
-    record_file = output_dir / f"colmi_{device_address.replace(':', '_')}_{asyncio.get_event_loop().time()}.bin"
+    record_file = output_dir / f"colmi_{device_address.replace(':', '_')}_{time.time()}.bin"
     
     print(f"Connecting to device {device_address}...")
     print(f"Recording raw data to {record_file}")
@@ -55,30 +117,43 @@ async def main():
         print(f"Forwarding combined sensor data to serial port {serial_port}")
     print("Starting real-time visualization of all sensor data")
     
-    # Initialize client with visualization enabled
-    async with Client(
-        address=device_address, 
-        record_to=record_file, 
-        use_mqtt=True, 
-        serial_port=serial_port,
-        use_visualization=True
-    ) as client:
-        # Get device info
-        device_info = await client.get_device_info()
-        print(f"Connected to device: {device_info}")
+    # Set up the event loop
+    loop = asyncio.get_event_loop()
+    
+    # Initialize client
+    client = loop.run_until_complete(setup_client(device_address, serial_port, record_file))
+    
+    try:
+        # Start the heart rate monitoring in a separate task
+        monitoring_task = loop.create_task(monitor_heartbeat(client))
         
-        # Get battery info
-        battery_info = await client.get_battery()
-        print(f"Battery level: {battery_info.level}%")
+        # Run the visualization in the main thread
+        print("Starting visualization window (close the window to exit)")
+        client._start_visualization()
         
-        # Start real-time heart rate monitoring
-        print("Starting real-time heart rate monitoring.")
-        print("Heart rate data will be integrated with blanket sensor data from MQTT.")
-        print("Data is being visualized in real-time. Close graph window to stop.")
-        print("Press 'q' to stop monitoring...")
-        await client.get_realtime_reading(RealTimeReading.HEART_RATE)
+        # After visualization window is closed, clean up
+        if monitoring_active:
+            print("Stopping heart rate monitoring...")
+            monitoring_task.cancel()
+            try:
+                loop.run_until_complete(monitoring_task)
+            except asyncio.CancelledError:
+                pass
         
-        print("Monitoring completed.")
+        # Clean up the client
+        loop.run_until_complete(cleanup_client(client))
+        
+    except KeyboardInterrupt:
+        print("Interrupted by user")
+        if monitoring_active:
+            monitoring_task.cancel()
+            try:
+                loop.run_until_complete(monitoring_task)
+            except asyncio.CancelledError:
+                pass
+        loop.run_until_complete(cleanup_client(client))
+    
+    print("Program completed.")
 
 if __name__ == "__main__":
-    asyncio.run(main()) 
+    main() 

@@ -95,13 +95,14 @@ class Client:
         self.use_visualization = use_visualization
         self.visualizer = None
         if use_visualization:
+            # Create the visualizer but don't start it yet
             self.visualizer = SensorDataVisualizer()
-            # Start visualization in a separate thread
-            self.viz_thread = threading.Thread(target=self._start_visualization)
-            self.viz_thread.daemon = True
-            self.viz_thread.start()
-            logger.info("Started visualization")
-        
+            print("Created visualization instance")
+            logger.info("Created visualization instance")
+        else:
+            print("Visualization disabled")
+            logger.info("Visualization disabled")
+
         # MQTT setup
         self.use_mqtt = use_mqtt
         if use_mqtt:
@@ -117,9 +118,24 @@ class Client:
             logger.info("Connected to MQTT broker")
 
     def _start_visualization(self):
-        """Start the visualization in a separate thread."""
+        """Start the visualization in the main thread."""
         if self.visualizer:
+            logger.info("Starting visualization in main thread")
             self.visualizer.start()
+            logger.info("Visualization window closed")
+            
+    def start_visualization_nonblocking(self):
+        """
+        Start visualization in a separate thread.
+        Note: This might cause issues as matplotlib prefers to run in the main thread.
+        """
+        if self.visualizer and not self.visualizer.running:
+            logger.info("Starting visualization in background thread")
+            print("Starting visualization in background thread")
+            self.viz_thread = threading.Thread(target=self._start_visualization)
+            self.viz_thread.daemon = True
+            self.viz_thread.start()
+            logger.info("Visualization thread started")
 
     # MQTT callback for when the client connects to the broker
     def _on_mqtt_connect(self, client, userdata, flags, rc):
@@ -135,72 +151,64 @@ class Client:
             logger.info(f"Received MQTT message from topic {msg.topic}: {payload}")
             
             # Add heart rate to blanket sensor data if available
-            if msg.topic == "minori-blanket-sensors" and self.latest_heart_rate is not None:
+            if msg.topic == "minori-blanket-sensors":
+                self.start_visualization_nonblocking()
                 try:
                     # Parse the JSON
                     data = json.loads(payload)
                     
-                    # Add heart rate to the data
-                    data["heartrate"] = self.latest_heart_rate
+                    # Add heart rate to the data if available
+                    if self.latest_heart_rate is not None:
+                        data["heartrate"] = self.latest_heart_rate
+                        # Convert back to JSON for serial and logging
+                        enhanced_payload = json.dumps(data)
+                        logger.info(f"Added heart rate to blanket sensor data: {enhanced_payload}")
+                        print(f"Added heart rate to blanket sensor data: {enhanced_payload}")
+                    else:
+                        logger.info("No heart rate data available yet")
                     
-                    # Convert back to JSON
-                    enhanced_payload = json.dumps(data)
-                    logger.info(f"Added heart rate to blanket sensor data: {enhanced_payload}")
-                    print(f"Added heart rate to blanket sensor data: {enhanced_payload}")
-                    
-                    # Update visualization if enabled
+                    # Update visualization regardless of heart rate availability
                     if self.visualizer:
-                        self.visualizer.update_data(data)
+                        # Ensure all values are properly converted to float
+                        cleaned_data = {}
+                        for key, value in data.items():
+                            try:
+                                cleaned_data[key] = float(value)
+                            except (ValueError, TypeError):
+                                logger.warning(f"Could not convert {key}={value} to float")
+                                # Skip this value
+                        
+                        logger.info(f"Updating visualization with data: {cleaned_data}")
+                        self.visualizer.update_data(cleaned_data)
+                        print(f"Updated visualization with data points: {list(cleaned_data.keys())}")
                     
-                    # Send the enhanced data to serial port if connected
+                    # Send to serial port if connected
                     if self.serial_conn and self.serial_conn.is_open:
                         try:
-                            self.serial_conn.write((enhanced_payload + '\n').encode())
-                            logger.debug(f"Sent to serial port: {enhanced_payload}")
+                            serial_payload = json.dumps(data) if self.latest_heart_rate is None else enhanced_payload
+                            self.serial_conn.write((serial_payload + '\n').encode())
+                            logger.debug(f"Sent to serial port: {serial_payload}")
                         except Exception as e:
                             logger.error(f"Failed to send to serial port: {e}")
                     
                     # Format display based on the topic
-                    print("\n===== ENHANCED SENSOR DATA =====")
+                    print("\n===== SENSOR DATA =====")
                     for key, value in data.items():
                         print(f"  {key}: {value}")
-                    print("===============================\n")
+                    print("=======================\n")
                     
                     # Return early since we've handled the message
                     return
                 except json.JSONDecodeError:
                     # If not JSON, fall back to standard handling
-                    logger.warning("Failed to parse blanket sensor data as JSON")
+                    logger.warning(f"Failed to parse blanket sensor data as JSON: {payload}")
             
-            # Original handling for non-JSON or other topics
-            # Send to serial port if connected
-            if self.serial_conn and self.serial_conn.is_open and msg.topic == "minori-blanket-sensors":
-                try:
-                    self.serial_conn.write((payload + '\n').encode())
-                    logger.debug(f"Sent to serial port: {payload}")
-                except Exception as e:
-                    logger.error(f"Failed to send to serial port: {e}")
-            
-            # Format display based on the topic
-            if msg.topic == "minori-blanket-sensors":
-                try:
-                    # Try to parse as JSON if it's in that format
-                    data = json.loads(payload)
-                    print("\n===== BLANKET SENSOR DATA =====")
-                    if isinstance(data, dict):
-                        for key, value in data.items():
-                            print(f"  {key}: {value}")
-                    else:
-                        print(f"  Value: {data}")
-                    print("===============================\n")
-                except json.JSONDecodeError:
-                    # If not JSON, just print the raw data
-                    print(f"\n===== BLANKET SENSOR DATA =====\n  {payload}\n===============================\n")
-            else:
-                # For other topics
-                print(f"MQTT [{msg.topic}]: {payload}")
+            # Handle other topics or non-JSON data
+            print(f"MQTT [{msg.topic}]: {payload}")
         except Exception as e:
             logger.error(f"Error processing MQTT message: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def __aenter__(self) -> "Client":
         logger.info(f"Connecting to {self.address}")

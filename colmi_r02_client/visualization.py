@@ -25,6 +25,8 @@ class SensorDataVisualizer:
         self.running = False
         self.fig = None
         self.axes = None
+        self.update_count = 0
+        self._user_update_callback = None  # Custom user callback
         
         # Initialize data storage
         self.timestamps = deque(maxlen=max_points)
@@ -36,6 +38,12 @@ class SensorDataVisualizer:
             "temperature": deque(maxlen=max_points),
             "humidity": deque(maxlen=max_points)
         }
+        
+        # Initialize with some dummy data to avoid empty plots
+        current_time = datetime.now()
+        self.timestamps.append(current_time)
+        for key in self.data:
+            self.data[key].append(None)
         
         # Default colors for each data type
         self.colors = {
@@ -53,8 +61,11 @@ class SensorDataVisualizer:
         # Lock for thread safety
         self.lock = threading.Lock()
         
+        logger.info("SensorDataVisualizer initialized")
+        
     def setup_plot(self):
         """Set up the matplotlib figure and axes."""
+        logger.info("Setting up visualization plot")
         plt.style.use('dark_background')  # Use dark theme for better visibility
         
         # Create figure and subplot grid (3x2)
@@ -83,12 +94,17 @@ class SensorDataVisualizer:
             
             # Set initial y-limits based on expected data ranges
             ax.set_ylim(self._get_y_limits(data_type))
+            
+            # Set initial x-limits
+            ax.set_xlim(0, 10)
         
-        # Add timestamp to the figure
+        # Add timestamp and status to the figure
         self.timestamp_text = self.fig.text(0.5, 0.01, '', ha='center')
+        self.status_text = self.fig.text(0.01, 0.01, 'Waiting for data...', ha='left')
         
         # Adjust spacing
         self.fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+        logger.info("Plot setup complete")
         
     def _get_unit(self, data_type: str) -> str:
         """Return the appropriate unit for each data type."""
@@ -121,70 +137,108 @@ class SensorDataVisualizer:
         Args:
             new_data: Dictionary containing sensor data values
         """
-        with self.lock:
-            # Add current timestamp
-            current_time = datetime.now()
-            self.timestamps.append(current_time)
+        if not self.running:
+            logger.warning("Attempted to update data but visualizer is not running")
+            return
             
-            # Update each data series with new values or None if missing
-            for data_type in self.data:
-                if data_type in new_data and new_data[data_type] is not None:
-                    try:
-                        value = float(new_data[data_type])
-                        self.data[data_type].append(value)
-                    except (ValueError, TypeError):
-                        logger.warning(f"Invalid {data_type} value: {new_data[data_type]}")
+        with self.lock:
+            try:
+                # Add current timestamp
+                current_time = datetime.now()
+                self.timestamps.append(current_time)
+                
+                self.update_count += 1
+                logger.info(f"Updating visualization data (update #{self.update_count}): {new_data}")
+                
+                # Update each data series with new values or None if missing
+                for data_type in self.data:
+                    if data_type in new_data and new_data[data_type] is not None:
+                        try:
+                            value = float(new_data[data_type])
+                            self.data[data_type].append(value)
+                            logger.debug(f"Added {data_type} = {value}")
+                        except (ValueError, TypeError):
+                            logger.warning(f"Invalid {data_type} value: {new_data[data_type]}")
+                            self.data[data_type].append(None)
+                    else:
+                        # If data is missing, append None to maintain alignment
                         self.data[data_type].append(None)
-                else:
-                    # If data is missing, append None to maintain alignment
-                    self.data[data_type].append(None)
+                        logger.debug(f"No data for {data_type}")
+                
+                logger.debug(f"Current data sizes: {[len(self.data[k]) for k in self.data]}")
+            except Exception as e:
+                logger.error(f"Error updating visualization data: {e}")
+                import traceback
+                traceback.print_exc()
     
     def _update_plot(self, frame):
         """Update function for matplotlib animation."""
+        # Call user callback if provided
+        if self._user_update_callback:
+            continue_updates = self._user_update_callback(frame)
+            if continue_updates is False:
+                logger.info("User callback requested animation to stop")
+                self.stop()
+                return list(self.lines.values())
+                
         with self.lock:
-            # Convert timestamps to relative seconds for x-axis
-            if not self.timestamps:
-                return self.lines.values()
-                
-            x_data = [(t - self.timestamps[0]).total_seconds() for t in self.timestamps]
-            
-            # Update each line with new data
-            for data_type, line in self.lines.items():
-                # Remove None values for plotting but keep indices aligned
-                valid_indices = [i for i, val in enumerate(self.data[data_type]) if val is not None]
-                valid_x = [x_data[i] for i in valid_indices]
-                valid_y = [self.data[data_type][i] for i in valid_indices]
-                
-                # Update line data
-                line.set_data(valid_x, valid_y)
-                
-                # Adjust x-axis limits to show all data
-                ax = line.axes
-                if valid_x:
-                    ax.set_xlim(0, max(x_data) + 1)
-                
-                # Dynamically adjust y-axis if data exceeds current limits
-                if valid_y:
-                    ymin, ymax = ax.get_ylim()
-                    data_min, data_max = min(valid_y), max(valid_y)
+            try:
+                # Convert timestamps to relative seconds for x-axis
+                if not self.timestamps:
+                    return list(self.lines.values())
                     
-                    # Add padding to limits
-                    if data_min < ymin:
-                        ax.set_ylim(bottom=data_min * 0.9)
-                    if data_max > ymax:
-                        ax.set_ylim(top=data_max * 1.1)
-            
-            # Update timestamp
-            if self.timestamps:
-                self.timestamp_text.set_text(f'Last update: {self.timestamps[-1].strftime("%H:%M:%S")}')
+                x_data = [(t - self.timestamps[0]).total_seconds() for t in self.timestamps]
                 
-        return self.lines.values()
+                # Update status text
+                self.status_text.set_text(f'Updates: {self.update_count}')
+                
+                # Update each line with new data
+                for data_type, line in self.lines.items():
+                    # Remove None values for plotting but keep indices aligned
+                    valid_indices = [i for i, val in enumerate(self.data[data_type]) if val is not None]
+                    valid_x = [x_data[i] for i in valid_indices]
+                    valid_y = [self.data[data_type][i] for i in valid_indices]
+                    
+                    # Update line data
+                    line.set_data(valid_x, valid_y)
+                    
+                    # Adjust x-axis limits to show all data
+                    ax = line.axes
+                    if valid_x:
+                        ax.set_xlim(0, max(x_data) + 1)
+                    
+                    # Dynamically adjust y-axis if data exceeds current limits
+                    if valid_y:
+                        ymin, ymax = ax.get_ylim()
+                        data_min, data_max = min(valid_y), max(valid_y)
+                        
+                        # Add padding to limits
+                        if data_min < ymin:
+                            ax.set_ylim(bottom=data_min * 0.9)
+                        if data_max > ymax:
+                            ax.set_ylim(top=data_max * 1.1)
+                
+                # Update timestamp
+                if self.timestamps:
+                    self.timestamp_text.set_text(f'Last update: {self.timestamps[-1].strftime("%H:%M:%S")}')
+                    
+                # Force redraw
+                self.fig.canvas.draw_idle()
+                
+                return list(self.lines.values())
+            except Exception as e:
+                logger.error(f"Error updating plot: {e}")
+                import traceback
+                traceback.print_exc()
+                return list(self.lines.values())
     
     def start(self):
         """Start the visualization."""
         if self.running:
+            logger.warning("Visualization is already running")
             return
             
+        logger.info("Starting visualization")
         self.running = True
         
         # Set up the plot if not done already
@@ -200,13 +254,26 @@ class SensorDataVisualizer:
         )
         
         # Show the plot (this will block until the window is closed)
+        logger.info("Showing visualization plot window")
         plt.show()
+        logger.info("Visualization window closed")
         
     def stop(self):
         """Stop the visualization."""
+        if not self.running:
+            return
+            
+        logger.info("Stopping visualization")
         self.running = False
         if hasattr(self, 'ani'):
             self.ani.event_source.stop()
+            
+        # Close the figure
+        if self.fig is not None:
+            plt.close(self.fig)
+            self.fig = None
+        
+        logger.info("Visualization stopped")
 
 
 # Function to parse JSON from serial or MQTT
