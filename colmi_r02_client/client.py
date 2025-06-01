@@ -141,8 +141,8 @@ class Client:
     def _on_mqtt_connect(self, client, userdata, flags, rc):
         logger.info(f"Connected to MQTT broker with result code {rc}")
         # Subscribe to topics (including the blanket sensors topic)
-        client.subscribe("minori-blanket-sensors")
-        logger.info("Subscribed to minori-blanket-sensors topic")
+        client.subscribe("minori-blanket-sensor")
+        logger.info("Subscribed to minori-blanket-sensor topic")
     
     # MQTT callback for when a message is received
     def _on_mqtt_message(self, client, userdata, msg):
@@ -151,7 +151,7 @@ class Client:
             logger.info(f"Received MQTT message from topic {msg.topic}: {payload}")
             
             # Add heart rate to blanket sensor data if available
-            if msg.topic == "minori-blanket-sensors":
+            if msg.topic == "minori-blanket-sensor":
                 self.start_visualization_nonblocking()
                 try:
                     # Parse the JSON
