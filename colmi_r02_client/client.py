@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from types import TracebackType
 from typing import Any
+import time
 
 from bleak import BleakClient
 from bleak.backends.characteristic import BleakGATTCharacteristic
@@ -233,16 +234,26 @@ class Client:
         error = False
         stopping = False
         
-                 # To use Arduino IoT Client, we need to set up authentication
+        # To use Arduino IoT Client, we need to set up authentication
         try:
-            # Import required libraries for new authentication method
-            from oauthlib.oauth2 import BackendApplicationClient
-            from requests_oauthlib import OAuth2Session
-            import iot_api_client as iot
-            from iot_api_client.exceptions import ApiException
-            from iot_api_client.configuration import Configuration
-            from iot_api_client.api import PropertiesV2Api, ThingsV2Api
-            
+            # Try importing all required packages
+            try:
+                # Arduino IoT Client
+                import arduino_iot_client
+                from arduino_iot_client.configuration import Configuration
+                from arduino_iot_client.api_client import ApiClient
+                from arduino_iot_client.apis.properties_v2_api import PropertiesV2Api
+                from arduino_iot_client.apis.things_v2_api import ThingsV2Api
+                
+                # OAuth packages
+                from oauthlib.oauth2 import BackendApplicationClient
+                from requests_oauthlib import OAuth2Session
+            except ImportError as e:
+                logger.error(f"Missing required package: {e}")
+                logger.error("Please install required packages with: pip install arduino-iot-client requests-oauthlib")
+                error = True
+                return None
+                
             # Setup for stopping via keyboard
             def check_for_quit():
                 nonlocal stopping
@@ -272,64 +283,71 @@ class Client:
             # Ideally these should come from environment variables or a secure config
             client_id = os.environ.get("ARDUINO_CLIENT_ID_SLEEPMONITOR_MINORI")
             client_secret = os.environ.get("ARDUINO_CLIENT_SECRET_SLEEPMONITOR_MINORI")
-            # thing_id = os.environ.get("ARDUINO_THING_ID_SLEEPMONITOR_MINORI")
-            # property_id = os.environ.get("ARDUINO_PROPERTY_ID_SLEEPMONITOR_MINORI")
-            # org_id = os.environ.get("ARDUINO_ORG_ID_SLEEPMONITOR_MINORI")  # Optional organization ID
-            org_id = False
-
-            # if not all([client_id, client_secret, thing_id, property_id]):
-            #     logger.error("Arduino IoT credentials not provided. Please set environment variables: "
-            #                 "ARDUINO_CLIENT_ID_SLEEPMONITOR_MINORI, ARDUINO_CLIENT_SECRET_SLEEPMONITOR_MINORI, "
-            #                 "ARDUINO_THING_ID_SLEEPMONITOR_MINORI, ARDUINO_PROPERTY_ID_SLEEPMONITOR_MINORI")
-            #     error = True
-            #     return None
+            thing_id = os.environ.get("ARDUINO_THING_ID_SLEEPMONITOR_MINORI")
+            property_id = os.environ.get("ARDUINO_PROPERTY_ID_SLEEPMONITOR_MINORI")
             
-            # Get an OAuth2 token using the new method
-            logger.info("Getting OAuth2 token for Arduino IoT Cloud...")
+            if not all([client_id, client_secret, thing_id, property_id]):
+                logger.error("Arduino IoT credentials not provided. Please set environment variables: "
+                            "ARDUINO_CLIENT_ID_SLEEPMONITOR_MINORI, ARDUINO_CLIENT_SECRET_SLEEPMONITOR_MINORI, ARDUINO_THING_ID_SLEEPMONITOR_MINORI, ARDUINO_PROPERTY_ID_SLEEPMONITOR_MINORI")
+                error = True
+                return None
+                
+            # Configure Arduino IoT Client with proper OAuth2 authentication
+            from oauthlib.oauth2 import BackendApplicationClient
+            from requests_oauthlib import OAuth2Session
+            
+            # Set up OAuth2 session
+            auth_url = "https://api2.arduino.cc/iot/v1/clients/token"
             oauth_client = BackendApplicationClient(client_id=client_id)
-            token_url = "https://api2.arduino.cc/iot/v1/clients/token"
-            
             oauth = OAuth2Session(client=oauth_client)
             
-            # Include organization ID if available
-            if org_id:
-                token = oauth.fetch_token(
-                    token_url=token_url,
-                    client_id=client_id,
-                    client_secret=client_secret,
-                    include_client_id=True,
-                    audience="https://api2.arduino.cc/iot",
-                    headers={"X-Organization": org_id}
-                )
-            else:
-                token = oauth.fetch_token(
-                    token_url=token_url,
-                    client_id=client_id,
-                    client_secret=client_secret,
-                    include_client_id=True,
-                    audience="https://api2.arduino.cc/iot"
-                )
+            # Get token
+            logger.info("Authenticating with Arduino IoT Cloud...")
+            token = oauth.fetch_token(
+                token_url=auth_url,
+                client_id=client_id,
+                client_secret=client_secret,
+                include_client_id=True,
+                audience="https://api2.arduino.cc/iot"
+            )
             
-            access_token = token.get("access_token")
-            logger.info("Successfully obtained Arduino IoT Cloud access token")
+            logger.info("Successfully authenticated with Arduino IoT Cloud")
             
-            # Configure API client with the token
-            client_config = Configuration(host="https://api2.arduino.cc/iot")
-            client_config.access_token = access_token
+            # Use the token for API requests
+            configuration = Configuration(host="https://api2.arduino.cc/iot")
+            configuration.access_token = token['access_token']
             
-            # Create API client with organization ID if available
-            if org_id:
-                api_client = iot.ApiClient(client_config, header_name="X-Organization", header_value=org_id)
-            else:
-                api_client = iot.ApiClient(client_config)
+            # Create API client
+            api_client = ApiClient(configuration)
             
-            # Initialize APIs with the new client
-            properties_api = PropertiesV2Api(api_client)
+            # Initialize APIs
             things_api = ThingsV2Api(api_client)
+            properties_api = PropertiesV2Api(api_client)
             
             try:
+                # Set up variables for token refresh
+                token_expiry_time = time.time() + token.get('expires_in', 3600) - 300  # Refresh 5 min before expiry
+                
                 # Main data collection loop
                 while not stopping:
+                    # Check if token needs refreshing
+                    current_time = time.time()
+                    if current_time > token_expiry_time:
+                        logger.info("Refreshing Arduino IoT Cloud access token...")
+                        try:
+                            token = oauth.fetch_token(
+                                token_url=auth_url,
+                                client_id=client_id,
+                                client_secret=client_secret,
+                                include_client_id=True,
+                                audience="https://api2.arduino.cc/iot"
+                            )
+                            configuration.access_token = token['access_token']
+                            token_expiry_time = time.time() + token.get('expires_in', 3600) - 300
+                            logger.info("Token refreshed successfully")
+                        except Exception as e:
+                            logger.error(f"Failed to refresh token: {e}")
+                            
                     try:
                         # Get data from the device
                         data: real_time.Reading | real_time.ReadingError = await asyncio.wait_for(
@@ -348,30 +366,13 @@ class Client:
                             
                             # Send data to Arduino IoT Cloud
                             try:
-                                # Arduino IoT Cloud expects specific format for property publishing
-                                timestamp = int(time.time() * 1000)
-                                # Format may vary based on the property type; adjust as needed
-                                value = data.value
-                                
-                                # Using the new API format for publishing property values
-                                # if org_id:
-                                #     org_id = Falseproperties_api.properties_v2_publish(
-                                #         id=property_id, 
-                                #         # property_value=value,
-                                #         # x_organization=org_id
-                                #     org_id = False)
-
-                                # else:
-                                #     properties_api.properties_v2_publish(
-                                #         id=property_id, 
-                                #         property_value=value
-                                #     )
-                                    
+                                # Format data correctly for Arduino IoT Cloud
+                                # For numeric properties, we just need the value
+                                properties_api.properties_v2_publish(thing_id, property_id, data.value)
                                 logger.info(f"Sent value {data.value} to Arduino IoT Cloud")
-                            except ApiException as e:
-                                logger.error(f"API error sending data to Arduino IoT Cloud: {e}")
                             except Exception as e:
                                 logger.error(f"Error sending data to Arduino IoT Cloud: {e}")
+                                logger.exception(e)  # Log full exception details
                     
                     except asyncio.TimeoutError:
                         # If we time out waiting for data, check if we're stopping
@@ -381,9 +382,8 @@ class Client:
                 logger.error(f"Error in Arduino IoT data collection: {e}")
                 error = True
                 
-        except ImportError as ie:
-            logger.error(f"Required packages not installed: {ie}")
-            logger.error("Install required packages with: pip install requests-oauthlib iot-api-client")
+        except ImportError:
+            logger.error("Arduino IoT Client not installed. Run 'pip install arduino-iot-client'")
             error = True
         
         finally:
