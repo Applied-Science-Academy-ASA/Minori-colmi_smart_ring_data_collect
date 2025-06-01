@@ -65,8 +65,17 @@ You can get it on [here on AliExpress](https://www.aliexpress.com/item/100500663
 
 If you don't know python that well, I **highly** recommend you install [pipx](https://pipx.pypa.io/stable/installation/). It's purpose built for managing python packages intended to be used as standalone programs and it will keep your computer safe from the pitfalls of python packaging. Once installed you can do
 
+
+for the firsttime:
 ```sh
 pipx install git+https://github.com/Applied-Science-Academy-ASA/Minori-colmi_smart_ring_data_collect
+
+```
+
+for update:
+```sh
+pipx install git+https://github.com/Applied-Science-Academy-ASA/Minori-colmi_smart_ring_data_collect --force
+
 ```
 
 Once that is done you can look for nearby rings using
@@ -79,13 +88,13 @@ colmi_r02_util scan
 Found device(s)
                 Name  | Address
 --------------------------------------------
-            R02_341C  |  70:CB:0D:D0:34:1C
+            R06_C87D  |  2A:BF:AB:80:C8:7D
 ```
 
 Once you have your address you can use it to do things like get real time heart rate
 
 ```sh
-colmi_r02_client --address=70:CB:0D:D0:34:1C get-real-time heart-rate
+colmi_r02_client --address=2A:BF:AB:80:C8:7D get-real-time heart-rate
 ```
 
 ```
@@ -96,7 +105,7 @@ Starting reading, please wait.
 You can also sync the data from your ring to sqlite
 
 ```sh
-colmi_r02_client --address=3A:08:6A:6F:EB:EC sync
+colmi_r02_client --address=2A:BF:AB:80:C8:7D sync
 ```
 
 ```
