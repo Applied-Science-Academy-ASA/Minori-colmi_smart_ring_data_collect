@@ -74,6 +74,7 @@ pipx install git+https://github.com/Applied-Science-Academy-ASA/Minori-colmi_sma
 
 for update:
 ```sh
+pipx uninsatll colmi_r02_client
 pipx install git+https://github.com/Applied-Science-Academy-ASA/Minori-colmi_smart_ring_data_collect --force
 
 ```
