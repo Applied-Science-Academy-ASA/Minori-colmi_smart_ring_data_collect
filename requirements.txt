@@ -1,0 +1,3 @@
+adafruit-circuitpython-mpu6050
+adafruit-circuitpython-bme280
+adafruit-circuitpython-ads1x15
