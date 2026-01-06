@@ -11,7 +11,6 @@ bleak = "^0.22.2"
 asyncclick = "^8.1.7.2"
 sqlalchemy = "^2.0.36"
 paho-mqtt = "^2.1.0"
-pyserial = "^3.5.0"
 matplotlib = ">=3.8.0"
 
 

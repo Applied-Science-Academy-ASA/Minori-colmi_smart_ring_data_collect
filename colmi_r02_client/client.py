@@ -14,8 +14,6 @@ import time
 from bleak import BleakClient
 from bleak.backends.characteristic import BleakGATTCharacteristic
 import paho.mqtt.client as mqtt
-import serial
-import serial.tools.list_ports
 
 from colmi_r02_client import battery, date_utils, steps, set_time, blink_twice, hr, hr_settings, packet, reboot, real_time
 from colmi_r02_client.visualization import SensorDataVisualizer
@@ -88,7 +86,6 @@ multi packet messages where the parser has state
 
 class Client:
     def __init__(self, address: str, record_to: Path | None = None, use_mqtt: bool = True, 
-                 serial_port: Optional[str] = "COM4", baud_rate: int = 115200,
                  use_visualization: bool = True, use_raspberry_pi_sensors: bool = False,
                  sensor_reporting_period_ms: int = 5000, i2c_sda_pin: int = 21, i2c_scl_pin: int = 22,
                  ads1115_address: int = 0x48, sound_adc_channel: int = 0, light_adc_channel: int = 1):
@@ -132,18 +129,6 @@ class Client:
         if use_raspberry_pi_sensors:
             self._init_raspberry_pi_sensors(i2c_sda_pin, i2c_scl_pin, ads1115_address, sound_adc_channel, light_adc_channel)
         
-        # Serial port setup
-        self.serial_port = serial_port
-        self.serial_conn = None
-        if serial_port:
-            try:
-                self.serial_conn = serial.Serial(serial_port, baud_rate, timeout=1)
-                logger.info(f"Connected to serial port {serial_port} at {baud_rate} baud")
-                print(f"Connected to serial port {serial_port} at {baud_rate} baud")
-            except serial.SerialException as e:
-                logger.error(f"Failed to connect to serial port {serial_port}: {e}")
-                print(f"Failed to connect to serial port {serial_port}: {e}")
-        
         # Visualization setup
         self.use_visualization = use_visualization
         self.visualizer = None
@@ -166,7 +151,7 @@ class Client:
             self.mqtt_client.on_message = self._on_mqtt_message
             
             # Connect to the broker
-            self.mqtt_client.connect("server.nikolaacademy.com", 1883, 60)
+            self.mqtt_client.connect("broker.mqtt.cool", 1883, 60)
             self.mqtt_client.loop_start()
             logger.info("Connected to MQTT broker")
             
@@ -414,7 +399,7 @@ class Client:
                     # Add heart rate to the data if available
                     if self.latest_heart_rate is not None:
                         data["heartrate"] = self.latest_heart_rate
-                        # Convert back to JSON for serial and logging
+                        # Convert back to JSON for logging
                         enhanced_payload = json.dumps(data)
                         logger.info(f"Added heart rate to blanket sensor data: {enhanced_payload}")
                         print(f"Added heart rate to blanket sensor data: {enhanced_payload}")
@@ -435,15 +420,6 @@ class Client:
                         logger.info(f"Updating visualization with data: {cleaned_data}")
                         self.visualizer.update_data(cleaned_data)
                         print(f"Updated visualization with data points: {list(cleaned_data.keys())}")
-                    
-                    # Send to serial port if connected
-                    if self.serial_conn and self.serial_conn.is_open:
-                        try:
-                            serial_payload = json.dumps(data) if self.latest_heart_rate is None else enhanced_payload
-                            self.serial_conn.write((serial_payload + '\n').encode())
-                            logger.debug(f"Sent to serial port: {serial_payload}")
-                        except Exception as e:
-                            logger.error(f"Failed to send to serial port: {e}")
                     
                     # Format display based on the topic
                     print("\n===== SENSOR DATA =====")
@@ -497,11 +473,6 @@ class Client:
         if self.visualizer:
             self.visualizer.stop()
             logger.info("Stopped visualization")
-        
-        # Close serial port if open
-        if self.serial_conn and self.serial_conn.is_open:
-            self.serial_conn.close()
-            logger.info("Closed serial port connection")
         
         # Clean up I2C resources
         if self.i2c:
@@ -749,29 +720,3 @@ class Client:
             sport_detail_logs.append(await self.get_steps(d))
 
         return FullData(self.address, heart_rates=heart_rate_logs, sport_details=sport_detail_logs)
-
-# Add a helper function at the end of the file to select a serial port
-def select_serial_port():
-    ports = list(serial.tools.list_ports.comports())
-    if not ports:
-        print("No serial ports available.")
-        return None
-    
-    print("\nAvailable serial ports:")
-    for i, port in enumerate(ports):
-        print(f"{i+1}. {port.device}: {port.description}")
-    
-    choice = input("\nSelect a port (number) or press Enter to skip: ")
-    if not choice.strip():
-        return None
-    
-    try:
-        index = int(choice) - 1
-        if 0 <= index < len(ports):
-            return ports[index].device
-        else:
-            print("Invalid selection.")
-            return select_serial_port()
-    except ValueError:
-        print("Please enter a number.")
-        return select_serial_port()

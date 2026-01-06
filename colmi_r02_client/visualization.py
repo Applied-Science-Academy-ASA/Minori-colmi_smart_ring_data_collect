@@ -276,7 +276,7 @@ class SensorDataVisualizer:
         logger.info("Visualization stopped")
 
 
-# Function to parse JSON from serial or MQTT
+# Function to parse JSON from MQTT
 def parse_sensor_data(data_str: str) -> Optional[Dict[str, Any]]:
     """Parse a JSON string into a dictionary of sensor data."""
     try:
