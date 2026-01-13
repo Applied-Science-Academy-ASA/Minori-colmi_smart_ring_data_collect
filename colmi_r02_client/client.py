@@ -14,27 +14,11 @@ import time
 from bleak import BleakClient
 from bleak.backends.characteristic import BleakGATTCharacteristic
 import paho.mqtt.client as mqtt
+import serial
+import serial.tools.list_ports
 
 from colmi_r02_client import battery, date_utils, steps, set_time, blink_twice, hr, hr_settings, packet, reboot, real_time
 from colmi_r02_client.visualization import SensorDataVisualizer
-
-# Try to import Raspberry Pi sensor libraries (optional)
-try:
-    import board
-    import busio
-    import adafruit_mpu6050
-    import adafruit_bme280
-    # For analog sensors, try ADS1115 ADC
-    try:
-        import adafruit_ads1x15.ads1115 as ADS
-        from adafruit_ads1x15.analog_in import AnalogIn
-        ADS1115_AVAILABLE = True
-    except ImportError:
-        ADS1115_AVAILABLE = False
-    RASPBERRY_PI_SENSORS_AVAILABLE = True
-except ImportError:
-    RASPBERRY_PI_SENSORS_AVAILABLE = False
-    ADS1115_AVAILABLE = False
 
 UART_SERVICE_UUID = "6E40FFF0-B5A3-F393-E0A9-E50E24DCCA9E"
 UART_RX_CHAR_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -84,11 +68,46 @@ multi packet messages where the parser has state
 """
 
 
+def select_serial_port() -> Optional[str]:
+    """
+    Automatically detect available serial ports and prompt user to select one.
+    
+    Returns:
+        Selected port name (e.g., "COM4" or "/dev/ttyUSB0") or None if no port selected
+    """
+    ports = list(serial.tools.list_ports.comports())
+    if not ports:
+        print("No serial ports available.")
+        return None
+    
+    print("\nAvailable serial ports:")
+    print(f"{'#':<4} {'Port':<15} {'Description'}")
+    print("-" * 60)
+    for i, port in enumerate(ports, 1):
+        description = port.description if port.description else "N/A"
+        print(f"{i:<4} {port.device:<15} {description}")
+    
+    while True:
+        choice = input("\nSelect a port (number) or press Enter to skip: ").strip()
+        if not choice:
+            return None
+        
+        try:
+            index = int(choice) - 1
+            if 0 <= index < len(ports):
+                selected_port = ports[index].device
+                print(f"Selected port: {selected_port}")
+                return selected_port
+            else:
+                print(f"Invalid selection. Please enter a number between 1 and {len(ports)}.")
+        except ValueError:
+            print("Please enter a valid number.")
+
+
 class Client:
     def __init__(self, address: str, record_to: Path | None = None, use_mqtt: bool = True, 
-                 use_visualization: bool = True, use_raspberry_pi_sensors: bool = False,
-                 sensor_reporting_period_ms: int = 5000, i2c_sda_pin: int = 21, i2c_scl_pin: int = 22,
-                 ads1115_address: int = 0x48, sound_adc_channel: int = 0, light_adc_channel: int = 1):
+                 serial_port: Optional[str] = None, baud_rate: int = 115200,
+                 use_visualization: bool = True):
         self.address = address
         self.bleak_client = BleakClient(self.address)
         self.queues: dict[int, asyncio.Queue] = {cmd: asyncio.Queue() for cmd in COMMAND_HANDLERS}
@@ -97,37 +116,22 @@ class Client:
         # Track the latest heart rate reading
         self.latest_heart_rate = None
         
-        # Raspberry Pi sensor setup
-        self.use_raspberry_pi_sensors = use_raspberry_pi_sensors
-        self.sensor_reporting_period_ms = sensor_reporting_period_ms
-        self.sensor_task = None
-        self.sensor_stopping = False
+        # Serial port setup
+        self.serial_conn = None
+        if serial_port is None:
+            # Auto-detect and prompt user to select port
+            serial_port = select_serial_port()
         
-        # Sensor objects
-        self.mpu = None
-        self.bme = None
-        self.i2c = None
-        self.ads = None
-        self.sound_channel = None
-        self.light_channel = None
-        
-        # Sensor data tracking
-        self.prev_accel_x = 0.0
-        self.prev_accel_y = 0.0
-        self.prev_accel_z = 0.0
-        
-        # Sound intensity tracking (similar to Arduino code)
-        self.sound_min = 4095
-        self.sound_max = 0
-        self.sound_intensity = 0
-        self.intensity_values = [0] * 10  # INTENSITY_AVG_COUNT = 10
-        self.intensity_index = 0
-        self.avg_sound_intensity = 0
-        self.ts_sound_window = 0
-        self.SOUND_WINDOW_MS = 20  # 20 milliseconds window
-        
-        if use_raspberry_pi_sensors:
-            self._init_raspberry_pi_sensors(i2c_sda_pin, i2c_scl_pin, ads1115_address, sound_adc_channel, light_adc_channel)
+        self.serial_port = serial_port
+        if serial_port:
+            try:
+                self.serial_conn = serial.Serial(serial_port, baud_rate, timeout=1)
+                logger.info(f"Connected to serial port {serial_port} at {baud_rate} baud")
+                print(f"Connected to serial port {serial_port} at {baud_rate} baud")
+            except serial.SerialException as e:
+                logger.error(f"Failed to connect to serial port {serial_port}: {e}")
+                print(f"Failed to connect to serial port {serial_port}: {e}")
+                self.serial_conn = None
         
         # Visualization setup
         self.use_visualization = use_visualization
@@ -154,10 +158,6 @@ class Client:
             self.mqtt_client.connect("broker.mqtt.cool", 1883, 60)
             self.mqtt_client.loop_start()
             logger.info("Connected to MQTT broker")
-            
-            # Start sensor reading task if enabled
-            if self.use_raspberry_pi_sensors:
-                self._start_sensor_reading_task()
 
     def _start_visualization(self):
         """Start the visualization in the main thread."""
@@ -178,203 +178,6 @@ class Client:
             self.viz_thread.daemon = True
             self.viz_thread.start()
             logger.info("Visualization thread started")
-    
-    def _init_raspberry_pi_sensors(self, i2c_sda_pin: int, i2c_scl_pin: int, 
-                                    ads1115_address: int, sound_adc_channel: int, light_adc_channel: int):
-        """Initialize Raspberry Pi sensors (MPU6050, BME280, and ADC for analog sensors)."""
-        if not RASPBERRY_PI_SENSORS_AVAILABLE:
-            logger.warning("Raspberry Pi sensor libraries not available. Install: adafruit-circuitpython-mpu6050 adafruit-circuitpython-bme280 adafruit-circuitpython-ads1x15")
-            print("Raspberry Pi sensor libraries not available. Install required packages.")
-            self.use_raspberry_pi_sensors = False
-            return
-        
-        try:
-            # Initialize I2C bus
-            self.i2c = busio.I2C(board.SCL, board.SDA)
-            logger.info(f"Initialized I2C bus (SDA: {i2c_sda_pin}, SCL: {i2c_scl_pin})")
-            
-            # Initialize MPU6050
-            try:
-                self.mpu = adafruit_mpu6050.MPU6050(self.i2c)
-                self.mpu.accelerometer_range = adafruit_mpu6050.Range.RANGE_8_G
-                self.mpu.gyro_range = adafruit_mpu6050.GyroRange.RANGE_500_DEG
-                self.mpu.filter_bandwidth = adafruit_mpu6050.Bandwidth.BAND_21_HZ
-                logger.info("MPU6050 initialized successfully")
-                print("MPU6050 initialized successfully")
-            except Exception as e:
-                logger.error(f"Failed to initialize MPU6050: {e}")
-                print(f"Failed to initialize MPU6050: {e}")
-                self.mpu = None
-            
-            # Initialize BME280
-            try:
-                self.bme = adafruit_bme280.Adafruit_BME280_I2C(self.i2c, address=0x76)
-                logger.info("BME280 initialized successfully")
-                print("BME280 initialized successfully")
-            except Exception as e:
-                logger.error(f"Failed to initialize BME280: {e}")
-                print(f"Failed to initialize BME280: {e}")
-                self.bme = None
-            
-            # Initialize ADS1115 for analog sensors (sound and light)
-            if ADS1115_AVAILABLE:
-                try:
-                    self.ads = ADS.ADS1115(self.i2c, address=ads1115_address)
-                    # Map channel numbers to ADS1115 pin constants
-                    channel_map = {0: ADS.P0, 1: ADS.P1, 2: ADS.P2, 3: ADS.P3}
-                    if sound_adc_channel not in channel_map or light_adc_channel not in channel_map:
-                        raise ValueError(f"Invalid ADC channel. Must be 0-3, got sound={sound_adc_channel}, light={light_adc_channel}")
-                    self.sound_channel = AnalogIn(self.ads, channel_map[sound_adc_channel])
-                    self.light_channel = AnalogIn(self.ads, channel_map[light_adc_channel])
-                    logger.info(f"ADS1115 initialized successfully (address: 0x{ads1115_address:02x}, sound=ch{sound_adc_channel}, light=ch{light_adc_channel})")
-                    print(f"ADS1115 initialized successfully (address: 0x{ads1115_address:02x}, sound=ch{sound_adc_channel}, light=ch{light_adc_channel})")
-                except Exception as e:
-                    logger.error(f"Failed to initialize ADS1115: {e}")
-                    print(f"Failed to initialize ADS1115: {e}")
-                    self.ads = None
-            else:
-                logger.warning("ADS1115 library not available. Analog sensors (sound/light) will not work.")
-                print("ADS1115 library not available. Install adafruit-circuitpython-ads1x15 for analog sensors.")
-        except Exception as e:
-            logger.error(f"Failed to initialize Raspberry Pi sensors: {e}")
-            print(f"Failed to initialize Raspberry Pi sensors: {e}")
-            self.use_raspberry_pi_sensors = False
-    
-    def _read_sensors(self) -> dict[str, Any]:
-        """Read all sensor values and return as dictionary."""
-        sensor_data = {}
-        
-        # Read MPU6050 (accelerometer/gyroscope)
-        if self.mpu:
-            try:
-                accel = self.mpu.acceleration
-                gyro = self.mpu.gyro
-                temp_mpu = self.mpu.temperature
-                
-                # Calculate movement (change in acceleration)
-                delta_x = abs(accel[0] - self.prev_accel_x)
-                delta_y = abs(accel[1] - self.prev_accel_y)
-                delta_z = abs(accel[2] - self.prev_accel_z)
-                
-                movement_value = max(delta_x, max(delta_y, delta_z))
-                
-                # Update previous acceleration values
-                self.prev_accel_x = accel[0]
-                self.prev_accel_y = accel[1]
-                self.prev_accel_z = accel[2]
-                
-                sensor_data["movement"] = round(movement_value, 2)
-            except Exception as e:
-                logger.error(f"Error reading MPU6050: {e}")
-        
-        # Read BME280 (temperature, humidity, pressure)
-        if self.bme:
-            try:
-                sensor_data["temperature"] = round(self.bme.temperature, 2)
-                sensor_data["humidity"] = round(self.bme.relative_humidity, 2)
-                # Note: pressure is available but not in the original Arduino payload
-            except Exception as e:
-                logger.error(f"Error reading BME280: {e}")
-        
-        # Read analog sensors (sound and light) via ADS1115
-        if self.ads and self.sound_channel and self.light_channel:
-            try:
-                # Read light value
-                light_value = int(self.light_channel.value)
-                sensor_data["light"] = light_value
-                
-                # Sound intensity is calculated continuously in the sensor loop
-                # Just use the current averaged value
-                sensor_data["sound"] = self.avg_sound_intensity
-            except Exception as e:
-                logger.error(f"Error reading analog sensors: {e}")
-        
-        return sensor_data
-    
-    def _start_sensor_reading_task(self):
-        """Start the sensor reading task in a background thread."""
-        if self.sensor_task is not None:
-            logger.warning("Sensor reading task already running")
-            return
-        
-        self.sensor_stopping = False
-        
-        def sensor_loop():
-            """Background thread loop for reading sensors and publishing to MQTT."""
-            logger.info("Starting sensor reading task")
-            ts_last_report = 0
-            
-            while not self.sensor_stopping:
-                try:
-                    current_time_ms = int(time.time() * 1000)
-                    
-                    # Continuously monitor sound levels (similar to Arduino code)
-                    if self.ads and self.sound_channel:
-                        try:
-                            current_sound_value = int(self.sound_channel.value)
-                            
-                            # Update min/max sound values
-                            if current_sound_value < self.sound_min:
-                                self.sound_min = current_sound_value
-                            if current_sound_value > self.sound_max:
-                                self.sound_max = current_sound_value
-                            
-                            # Reset the min/max values periodically and calculate intensity
-                            if current_time_ms - self.ts_sound_window > self.SOUND_WINDOW_MS:
-                                # Calculate sound intensity as the range between min and max
-                                self.sound_intensity = self.sound_max - self.sound_min
-                                
-                                # Add to moving average array
-                                self.intensity_values[self.intensity_index] = self.sound_intensity
-                                self.intensity_index = (self.intensity_index + 1) % len(self.intensity_values)
-                                
-                                # Calculate the average intensity
-                                avg_sum = sum(self.intensity_values)
-                                self.avg_sound_intensity = avg_sum // len(self.intensity_values)
-                                
-                                self.ts_sound_window = current_time_ms
-                                
-                                # Reset min/max for next window
-                                self.sound_min = 32767  # Max value for 16-bit ADC
-                                self.sound_max = 0
-                        except Exception as e:
-                            logger.debug(f"Error monitoring sound: {e}")
-                    
-                    # Read sensors and publish at the specified interval
-                    if current_time_ms - ts_last_report >= self.sensor_reporting_period_ms:
-                        sensor_data = self._read_sensors()
-                        
-                        if sensor_data and self.use_mqtt and self.mqtt_client.is_connected():
-                            # Prepare JSON payload (matching Arduino format)
-                            payload = json.dumps(sensor_data)
-                            
-                            # Publish to MQTT
-                            try:
-                                self.mqtt_client.publish("minori-blanket-sensors", payload)
-                                logger.debug(f"Published sensor data: {payload}")
-                                
-                                # Print sensor readings
-                                print("\n=== SENSOR READINGS ===")
-                                for key, value in sensor_data.items():
-                                    print(f"  {key}: {value}")
-                                print("========================\n")
-                            except Exception as e:
-                                logger.error(f"Failed to publish sensor data: {e}")
-                        
-                        ts_last_report = current_time_ms
-                    
-                    # Small sleep to prevent CPU spinning
-                    time.sleep(0.01)  # 10ms sleep for better sound monitoring resolution
-                except Exception as e:
-                    logger.error(f"Error in sensor reading loop: {e}")
-                    time.sleep(1)
-            
-            logger.info("Sensor reading task stopped")
-        
-        self.sensor_task = threading.Thread(target=sensor_loop)
-        self.sensor_task.daemon = True
-        self.sensor_task.start()
-        logger.info("Sensor reading task started")
 
     # MQTT callback for when the client connects to the broker
     def _on_mqtt_connect(self, client, userdata, flags, rc):
@@ -456,13 +259,6 @@ class Client:
         if exc_val is not None:
             logger.error("had an error")
         
-        # Stop sensor reading task if enabled
-        if self.use_raspberry_pi_sensors and self.sensor_task:
-            self.sensor_stopping = True
-            if self.sensor_task.is_alive():
-                self.sensor_task.join(timeout=2)
-            logger.info("Stopped sensor reading task")
-        
         # Disconnect MQTT if enabled
         if self.use_mqtt:
             self.mqtt_client.loop_stop()
@@ -474,12 +270,10 @@ class Client:
             self.visualizer.stop()
             logger.info("Stopped visualization")
         
-        # Clean up I2C resources
-        if self.i2c:
-            try:
-                self.i2c.deinit()
-            except Exception:
-                pass
+        # Close serial port if open
+        if self.serial_conn and self.serial_conn.is_open:
+            self.serial_conn.close()
+            logger.info("Closed serial port connection")
             
         await self.disconnect()
 
