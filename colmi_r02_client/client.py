@@ -14,8 +14,8 @@ import time
 from bleak import BleakClient
 from bleak.backends.characteristic import BleakGATTCharacteristic
 import paho.mqtt.client as mqtt
-import serial
-import serial.tools.list_ports
+import serial  # pyserial library
+import serial.tools.list_ports  # pyserial library
 
 from colmi_r02_client import battery, date_utils, steps, set_time, blink_twice, hr, hr_settings, packet, reboot, real_time
 from colmi_r02_client.visualization import SensorDataVisualizer
