@@ -9,6 +9,7 @@ from typing import Any, Optional
 import json
 import sys
 import threading
+import time
 
 from bleak import BleakClient
 from bleak.backends.characteristic import BleakGATTCharacteristic
@@ -67,9 +68,45 @@ multi packet messages where the parser has state
 """
 
 
+def select_serial_port() -> Optional[str]:
+    """
+    Automatically detect available serial ports and prompt user to select one.
+    
+    Returns:
+        Selected port name (e.g., "COM4" or "/dev/ttyUSB0") or None if no port selected
+    """
+    ports = list(serial.tools.list_ports.comports())
+    if not ports:
+        print("No serial ports available.")
+        return None
+    
+    print("\nAvailable serial ports:")
+    print(f"{'#':<4} {'Port':<15} {'Description'}")
+    print("-" * 60)
+    for i, port in enumerate(ports, 1):
+        description = port.description if port.description else "N/A"
+        print(f"{i:<4} {port.device:<15} {description}")
+    
+    while True:
+        choice = input("\nSelect a port (number) or press Enter to skip: ").strip()
+        if not choice:
+            return None
+        
+        try:
+            index = int(choice) - 1
+            if 0 <= index < len(ports):
+                selected_port = ports[index].device
+                print(f"Selected port: {selected_port}")
+                return selected_port
+            else:
+                print(f"Invalid selection. Please enter a number between 1 and {len(ports)}.")
+        except ValueError:
+            print("Please enter a valid number.")
+
+
 class Client:
     def __init__(self, address: str, record_to: Path | None = None, use_mqtt: bool = True, 
-                 serial_port: Optional[str] = "COM4", baud_rate: int = 115200,
+                 serial_port: Optional[str] = None, baud_rate: int = 115200,
                  use_visualization: bool = True):
         self.address = address
         self.bleak_client = BleakClient(self.address)
@@ -80,8 +117,12 @@ class Client:
         self.latest_heart_rate = None
         
         # Serial port setup
-        self.serial_port = serial_port
         self.serial_conn = None
+        if serial_port is None:
+            # Auto-detect and prompt user to select port
+            serial_port = select_serial_port()
+        
+        self.serial_port = serial_port
         if serial_port:
             try:
                 self.serial_conn = serial.Serial(serial_port, baud_rate, timeout=1)
@@ -90,6 +131,7 @@ class Client:
             except serial.SerialException as e:
                 logger.error(f"Failed to connect to serial port {serial_port}: {e}")
                 print(f"Failed to connect to serial port {serial_port}: {e}")
+                self.serial_conn = None
         
         # Visualization setup
         self.use_visualization = use_visualization
@@ -113,7 +155,7 @@ class Client:
             self.mqtt_client.on_message = self._on_mqtt_message
             
             # Connect to the broker
-            self.mqtt_client.connect("server.nikolaacademy.com", 1883, 60)
+            self.mqtt_client.connect("broker.mqtt.cool", 1883, 60)
             self.mqtt_client.loop_start()
             logger.info("Connected to MQTT broker")
 
@@ -160,7 +202,7 @@ class Client:
                     # Add heart rate to the data if available
                     if self.latest_heart_rate is not None:
                         data["heartrate"] = self.latest_heart_rate
-                        # Convert back to JSON for serial and logging
+                        # Convert back to JSON for logging
                         enhanced_payload = json.dumps(data)
                         logger.info(f"Added heart rate to blanket sensor data: {enhanced_payload}")
                         print(f"Added heart rate to blanket sensor data: {enhanced_payload}")
@@ -181,15 +223,6 @@ class Client:
                         logger.info(f"Updating visualization with data: {cleaned_data}")
                         self.visualizer.update_data(cleaned_data)
                         print(f"Updated visualization with data points: {list(cleaned_data.keys())}")
-                    
-                    # Send to serial port if connected
-                    if self.serial_conn and self.serial_conn.is_open:
-                        try:
-                            serial_payload = json.dumps(data) if self.latest_heart_rate is None else enhanced_payload
-                            self.serial_conn.write((serial_payload + '\n').encode())
-                            logger.debug(f"Sent to serial port: {serial_payload}")
-                        except Exception as e:
-                            logger.error(f"Failed to send to serial port: {e}")
                     
                     # Format display based on the topic
                     print("\n===== SENSOR DATA =====")
@@ -481,29 +514,3 @@ class Client:
             sport_detail_logs.append(await self.get_steps(d))
 
         return FullData(self.address, heart_rates=heart_rate_logs, sport_details=sport_detail_logs)
-
-# Add a helper function at the end of the file to select a serial port
-def select_serial_port():
-    ports = list(serial.tools.list_ports.comports())
-    if not ports:
-        print("No serial ports available.")
-        return None
-    
-    print("\nAvailable serial ports:")
-    for i, port in enumerate(ports):
-        print(f"{i+1}. {port.device}: {port.description}")
-    
-    choice = input("\nSelect a port (number) or press Enter to skip: ")
-    if not choice.strip():
-        return None
-    
-    try:
-        index = int(choice) - 1
-        if 0 <= index < len(ports):
-            return ports[index].device
-        else:
-            print("Invalid selection.")
-            return select_serial_port()
-    except ValueError:
-        print("Please enter a number.")
-        return select_serial_port()
