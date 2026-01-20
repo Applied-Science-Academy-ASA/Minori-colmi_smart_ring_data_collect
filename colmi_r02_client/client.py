@@ -345,7 +345,28 @@ class Client:
         await self.disconnect()
 
     async def connect(self):
-        await self.bleak_client.connect()
+        """Connect to the BLE device with retry logic for timeout errors."""
+        retry_delay = 2  # Wait 2 seconds between retries
+        attempt = 0
+        
+        while True:
+            attempt += 1
+            try:
+                await self.bleak_client.connect()
+                logger.info(f"Successfully connected to {self.address} after {attempt} attempt(s)")
+                print(f"Successfully connected to {self.address} after {attempt} attempt(s)")
+                break
+            except (TimeoutError, asyncio.TimeoutError, asyncio.CancelledError) as e:
+                logger.warning(f"Connection timeout (attempt {attempt}), retrying in {retry_delay} seconds...")
+                print(f"Connection timeout, retrying in {retry_delay} seconds... (attempt {attempt})")
+                await asyncio.sleep(retry_delay)
+                # Recreate the client if it was cancelled
+                if isinstance(e, asyncio.CancelledError):
+                    self.bleak_client = BleakClient(self.address)
+            except Exception as e:
+                # For other exceptions, log and re-raise
+                logger.error(f"Connection error: {e}")
+                raise
 
         nrf_uart_service = self.bleak_client.services.get_service(UART_SERVICE_UUID)
         assert nrf_uart_service
@@ -458,8 +479,9 @@ class Client:
                         timeout=3,  # Timeout for response
                     )
                     if isinstance(data, real_time.ReadingError):
-                        error = True
-                        break
+                        # Ignore errors and continue polling instead of breaking
+                        logger.debug(f"Reading error (code {data.code}), continuing...")
+                        continue
                     if data.value != 0:
                         # Comment out adding to valid_readings list
                         # valid_readings.append(data.value)
@@ -474,6 +496,10 @@ class Client:
                         
                         data_count += 1
                         last_data_time = asyncio.get_event_loop().time()
+                    else:
+                        # No heart rate detected (value == 0), but continue polling
+                        logger.debug("No heart rate detected (value == 0), continuing...")
+                        continue
                 except asyncio.TimeoutError:
                     # If timeout occurs, we'll check if we need to resend in the next loop
                     pass  # Just continue checking stopping flag

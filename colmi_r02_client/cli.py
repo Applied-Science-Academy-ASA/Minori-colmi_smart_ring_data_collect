@@ -153,8 +153,9 @@ async def get_real_time(client: Client, reading: str) -> None:
         result = await client.get_realtime_reading(reading_type)
         if result:
             click.echo(result)
-        else:
-            click.echo(f"Error, no {reading.replace('-', ' ')} detected. Is the ring being worn?")
+        # else:
+        #     # Ignore error message about no heart rate detected
+        #     click.echo(f"Error, no {reading.replace('-', ' ')} detected. Is the ring being worn?")
 
 
 @cli_client.command()
