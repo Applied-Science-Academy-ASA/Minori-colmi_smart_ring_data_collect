@@ -14,6 +14,7 @@ import csv
 
 from bleak import BleakClient
 from bleak.backends.characteristic import BleakGATTCharacteristic
+from bleak.exc import BleakError
 import paho.mqtt.client as mqtt
 import serial  # pyserial library
 import serial.tools.list_ports  # pyserial library
@@ -345,7 +346,7 @@ class Client:
         await self.disconnect()
 
     async def connect(self):
-        """Connect to the BLE device with retry logic for timeout errors."""
+        """Connect to the BLE device with retry logic for timeout errors and device not found errors."""
         retry_delay = 2  # Wait 2 seconds between retries
         attempt = 0
         
@@ -363,6 +364,13 @@ class Client:
                 # Recreate the client if it was cancelled
                 if isinstance(e, asyncio.CancelledError):
                     self.bleak_client = BleakClient(self.address)
+            except BleakError as e:
+                # Retry on BleakError (e.g., device not found)
+                logger.warning(f"Connection error (attempt {attempt}): {e}, retrying in {retry_delay} seconds...")
+                print(f"Connection error, retrying in {retry_delay} seconds... (attempt {attempt})")
+                await asyncio.sleep(retry_delay)
+                # Recreate the client to reset the connection state
+                self.bleak_client = BleakClient(self.address)
             except Exception as e:
                 # For other exceptions, log and re-raise
                 logger.error(f"Connection error: {e}")
