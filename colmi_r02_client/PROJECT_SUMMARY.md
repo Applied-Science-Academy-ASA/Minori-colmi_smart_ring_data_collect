@@ -71,7 +71,7 @@ This package provides a Python client for connecting to and communicating with t
 ---
 
 ### `client.py`
-**Purpose**: Core client class for BLE communication with the ring. Handles connection, packet sending/receiving, and integrates with MQTT and visualization.
+**Purpose**: Core client class for BLE communication with the ring. Handles connection, packet sending/receiving, and integrates with MQTT, serial port communication, and visualization.
 
 **Main Class: `Client`**
 
@@ -79,12 +79,9 @@ This package provides a Python client for connecting to and communicating with t
 - `address`: Bluetooth address of the ring
 - `record_to`: Optional path to record packets
 - `use_mqtt`: Enable MQTT publishing (default: True)
+- `serial_port`: Serial port name (e.g., "COM4" or "/dev/ttyUSB0"). If None, will auto-detect and prompt user to select
+- `baud_rate`: Serial port baud rate (default: 115200)
 - `use_visualization`: Enable real-time visualization (default: True)
-- `use_raspberry_pi_sensors`: Enable Raspberry Pi sensor reading (default: False)
-- `sensor_reporting_period_ms`: Sensor data reporting interval (default: 5000)
-- `i2c_sda_pin`, `i2c_scl_pin`: I2C pin configuration
-- `ads1115_address`: ADC address for analog sensors
-- `sound_adc_channel`, `light_adc_channel`: ADC channel mappings
 
 **Key Methods**:
 - `__aenter__()` / `__aexit__()`: Async context manager for connection lifecycle
@@ -107,9 +104,6 @@ This package provides a Python client for connecting to and communicating with t
 
 **Internal Methods**:
 - `_handle_tx()`: Callback for incoming BLE packets
-- `_init_raspberry_pi_sensors()`: Initialize MPU6050, BME280, and ADS1115 sensors
-- `_read_sensors() -> dict`: Read all sensor values
-- `_start_sensor_reading_task()`: Start background sensor reading thread
 - `_on_mqtt_connect()`: MQTT connection callback
 - `_on_mqtt_message()`: MQTT message handler
 - `_start_visualization()`: Start visualization in main thread
@@ -124,6 +118,7 @@ This package provides a Python client for connecting to and communicating with t
 - `FullData`: Container for synced data (address, heart_rates, sport_details)
 
 **Helper Functions**:
+- `select_serial_port() -> Optional[str]`: Automatically detect available serial ports and prompt user to select one
 
 ---
 
@@ -357,7 +352,7 @@ This package provides a Python client for connecting to and communicating with t
 - `sqlalchemy`: Database ORM
 - `matplotlib`: Visualization
 - `paho-mqtt`: MQTT client
-- `adafruit-circuitpython-*`: Optional Raspberry Pi sensor libraries
+- `pyserial`: Serial port communication
 
 ---
 
@@ -380,4 +375,5 @@ This package provides a Python client for connecting to and communicating with t
 - Some packet fields are not fully understood (marked with comments)
 - MQTT integration allows publishing sensor data to external systems
 - Visualization supports 6 sensor types with automatic scaling
-- Raspberry Pi sensor integration is optional and requires specific hardware
+- Serial port communication uses pyserial with automatic port detection
+- If `serial_port` is None during Client initialization, the system will automatically detect and prompt for port selection

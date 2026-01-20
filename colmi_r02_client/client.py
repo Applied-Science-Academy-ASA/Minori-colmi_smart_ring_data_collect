@@ -10,6 +10,7 @@ import json
 import sys
 import threading
 import time
+import csv
 
 from bleak import BleakClient
 from bleak.backends.characteristic import BleakGATTCharacteristic
@@ -18,7 +19,7 @@ import serial  # pyserial library
 import serial.tools.list_ports  # pyserial library
 
 from colmi_r02_client import battery, date_utils, steps, set_time, blink_twice, hr, hr_settings, packet, reboot, real_time
-from colmi_r02_client.visualization import SensorDataVisualizer
+# from colmi_r02_client.visualization import SensorDataVisualizer
 
 UART_SERVICE_UUID = "6E40FFF0-B5A3-F393-E0A9-E50E24DCCA9E"
 UART_RX_CHAR_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -107,7 +108,7 @@ def select_serial_port() -> Optional[str]:
 class Client:
     def __init__(self, address: str, record_to: Path | None = None, use_mqtt: bool = True, 
                  serial_port: Optional[str] = None, baud_rate: int = 115200,
-                 use_visualization: bool = True):
+                 use_visualization: bool = False):  # Disabled by default
         self.address = address
         self.bleak_client = BleakClient(self.address)
         self.queues: dict[int, asyncio.Queue] = {cmd: asyncio.Queue() for cmd in COMMAND_HANDLERS}
@@ -133,17 +134,48 @@ class Client:
                 print(f"Failed to connect to serial port {serial_port}: {e}")
                 self.serial_conn = None
         
-        # Visualization setup
-        self.use_visualization = use_visualization
+        # Visualization setup - COMMENTED OUT
+        # self.use_visualization = use_visualization
+        # self.visualizer = None
+        # if use_visualization:
+        #     # Create the visualizer but don't start it yet
+        #     self.visualizer = SensorDataVisualizer()
+        #     print("Created visualization instance")
+        #     logger.info("Created visualization instance")
+        # else:
+        #     print("Visualization disabled")
+        #     logger.info("Visualization disabled")
+        self.use_visualization = False
         self.visualizer = None
-        if use_visualization:
-            # Create the visualizer but don't start it yet
-            self.visualizer = SensorDataVisualizer()
-            print("Created visualization instance")
-            logger.info("Created visualization instance")
-        else:
-            print("Visualization disabled")
-            logger.info("Visualization disabled")
+        print("Visualization disabled")
+        logger.info("Visualization disabled")
+
+        # CSV logging setup
+        self.data_dir = Path("data")
+        self.data_dir.mkdir(exist_ok=True)
+        
+        # Generate timestamped filenames
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.serial_csv_path = self.data_dir / f"serial_data_{timestamp}.csv"
+        self.heartrate_csv_path = self.data_dir / f"heartrate_data_{timestamp}.csv"
+        
+        # Initialize CSV files with headers
+        self.csv_lock = threading.Lock()
+        
+        # Initialize serial data CSV
+        with open(self.serial_csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['timestamp', 'sound', 'light', 'movement', 'temperature', 'humidity', 'heartrate'])
+        
+        # Initialize heart rate CSV
+        with open(self.heartrate_csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['timestamp', 'heartrate'])
+        
+        logger.info(f"CSV logging initialized: {self.serial_csv_path}, {self.heartrate_csv_path}")
+        print(f"CSV logging initialized:")
+        print(f"  Serial data: {self.serial_csv_path}")
+        print(f"  Heart rate: {self.heartrate_csv_path}")
 
         # MQTT setup
         self.use_mqtt = use_mqtt
@@ -159,25 +191,56 @@ class Client:
             self.mqtt_client.loop_start()
             logger.info("Connected to MQTT broker")
 
-    def _start_visualization(self):
-        """Start the visualization in the main thread."""
-        if self.visualizer:
-            logger.info("Starting visualization in main thread")
-            self.visualizer.start()
-            logger.info("Visualization window closed")
-            
-    def start_visualization_nonblocking(self):
-        """
-        Start visualization in a separate thread.
-        Note: This might cause issues as matplotlib prefers to run in the main thread.
-        """
-        if self.visualizer and not self.visualizer.running:
-            logger.info("Starting visualization in background thread")
-            print("Starting visualization in background thread")
-            self.viz_thread = threading.Thread(target=self._start_visualization)
-            self.viz_thread.daemon = True
-            self.viz_thread.start()
-            logger.info("Visualization thread started")
+    def _log_serial_data_to_csv(self, data: dict):
+        """Log serial/sensor data to CSV file."""
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self.csv_lock:
+            try:
+                with open(self.serial_csv_path, 'a', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        timestamp,
+                        data.get('sound', ''),
+                        data.get('light', ''),
+                        data.get('movement', ''),
+                        data.get('temperature', ''),
+                        data.get('humidity', ''),
+                        data.get('heartrate', '')
+                    ])
+            except Exception as e:
+                logger.error(f"Error writing serial data to CSV: {e}")
+    
+    def _log_heartrate_to_csv(self, heartrate: int):
+        """Log heart rate data to CSV file."""
+        timestamp = datetime.now(timezone.utc).isoformat()
+        with self.csv_lock:
+            try:
+                with open(self.heartrate_csv_path, 'a', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([timestamp, heartrate])
+            except Exception as e:
+                logger.error(f"Error writing heart rate to CSV: {e}")
+
+    # Visualization methods - COMMENTED OUT
+    # def _start_visualization(self):
+    #     """Start the visualization in the main thread."""
+    #     if self.visualizer:
+    #         logger.info("Starting visualization in main thread")
+    #         self.visualizer.start()
+    #         logger.info("Visualization window closed")
+    #         
+    # def start_visualization_nonblocking(self):
+    #     """
+    #     Start visualization in a separate thread.
+    #     Note: This might cause issues as matplotlib prefers to run in the main thread.
+    #     """
+    #     if self.visualizer and not self.visualizer.running:
+    #         logger.info("Starting visualization in background thread")
+    #         print("Starting visualization in background thread")
+    #         self.viz_thread = threading.Thread(target=self._start_visualization)
+    #         self.viz_thread.daemon = True
+    #         self.viz_thread.start()
+    #         logger.info("Visualization thread started")
 
     # MQTT callback for when the client connects to the broker
     def _on_mqtt_connect(self, client, userdata, flags, rc):
@@ -194,7 +257,8 @@ class Client:
             
             # Add heart rate to blanket sensor data if available
             if msg.topic == "minori-blanket-sensors":
-                self.start_visualization_nonblocking()
+                # Visualization - COMMENTED OUT
+                # self.start_visualization_nonblocking()
                 try:
                     # Parse the JSON
                     data = json.loads(payload)
@@ -209,26 +273,29 @@ class Client:
                     else:
                         logger.info("No heart rate data available yet")
                     
-                    # Update visualization regardless of heart rate availability
-                    if self.visualizer:
-                        # Ensure all values are properly converted to float
-                        cleaned_data = {}
-                        for key, value in data.items():
-                            try:
-                                cleaned_data[key] = float(value)
-                            except (ValueError, TypeError):
-                                logger.warning(f"Could not convert {key}={value} to float")
-                                # Skip this value
-                        
-                        logger.info(f"Updating visualization with data: {cleaned_data}")
-                        self.visualizer.update_data(cleaned_data)
-                        print(f"Updated visualization with data points: {list(cleaned_data.keys())}")
+                    # Update visualization regardless of heart rate availability - COMMENTED OUT
+                    # if self.visualizer:
+                    #     # Ensure all values are properly converted to float
+                    #     cleaned_data = {}
+                    #     for key, value in data.items():
+                    #         try:
+                    #             cleaned_data[key] = float(value)
+                    #         except (ValueError, TypeError):
+                    #             logger.warning(f"Could not convert {key}={value} to float")
+                    #             # Skip this value
+                    #     
+                    #     logger.info(f"Updating visualization with data: {cleaned_data}")
+                    #     self.visualizer.update_data(cleaned_data)
+                    #     print(f"Updated visualization with data points: {list(cleaned_data.keys())}")
                     
                     # Format display based on the topic
                     print("\n===== SENSOR DATA =====")
                     for key, value in data.items():
                         print(f"  {key}: {value}")
                     print("=======================\n")
+                    
+                    # Log serial data to CSV
+                    self._log_serial_data_to_csv(data)
                     
                     # Return early since we've handled the message
                     return
@@ -265,10 +332,10 @@ class Client:
             self.mqtt_client.disconnect()
             logger.info("Disconnected from MQTT broker")
         
-        # Stop visualization if enabled
-        if self.visualizer:
-            self.visualizer.stop()
-            logger.info("Stopped visualization")
+        # Stop visualization if enabled - COMMENTED OUT
+        # if self.visualizer:
+        #     self.visualizer.stop()
+        #     logger.info("Stopped visualization")
         
         # Close serial port if open
         if self.serial_conn and self.serial_conn.is_open:
@@ -401,6 +468,9 @@ class Client:
                         # Instead of publishing to a separate topic, we'll modify the blanket sensor data
                         # Store the latest heart rate value to be added to blanket sensor data
                         self.latest_heart_rate = data.value
+                        
+                        # Log heart rate to CSV
+                        self._log_heartrate_to_csv(data.value)
                         
                         data_count += 1
                         last_data_time = asyncio.get_event_loop().time()
