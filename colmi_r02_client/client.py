@@ -7,6 +7,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Optional
 import json
+import os
 import sys
 import threading
 import time
@@ -208,6 +209,8 @@ class Client:
                         data.get('humidity', ''),
                         data.get('heartrate', '')
                     ])
+                    f.flush()  # Explicitly flush buffer to ensure data is written to disk
+                    os.fsync(f.fileno())  # Force write to disk (important for Linux/Raspberry Pi)
             except Exception as e:
                 logger.error(f"Error writing serial data to CSV: {e}")
     
@@ -219,6 +222,8 @@ class Client:
                 with open(self.heartrate_csv_path, 'a', newline='', encoding='utf-8') as f:
                     writer = csv.writer(f)
                     writer.writerow([timestamp, heartrate])
+                    f.flush()  # Explicitly flush buffer to ensure data is written to disk
+                    os.fsync(f.fileno())  # Force write to disk (important for Linux/Raspberry Pi)
             except Exception as e:
                 logger.error(f"Error writing heart rate to CSV: {e}")
 
