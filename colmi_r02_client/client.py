@@ -118,6 +118,10 @@ class Client:
         # Track the latest heart rate reading
         self.latest_heart_rate = None
         
+        # Create parser instances that we can reset for retry logic
+        self.heart_rate_parser = hr.HeartRateLogParser()
+        self.steps_parser = steps.SportDetailParser()
+        
         # Serial port setup
         self.serial_conn = None
         if serial_port is None:
@@ -180,17 +184,25 @@ class Client:
 
         # MQTT setup
         self.use_mqtt = use_mqtt
+        self.mqtt_client = None
         if use_mqtt:
-            self.mqtt_client = mqtt.Client()
-            
-            # Define MQTT callbacks
-            self.mqtt_client.on_connect = self._on_mqtt_connect
-            self.mqtt_client.on_message = self._on_mqtt_message
-            
-            # Connect to the broker
-            self.mqtt_client.connect("broker.mqtt.cool", 1883, 60)
-            self.mqtt_client.loop_start()
-            logger.info("Connected to MQTT broker")
+            try:
+                self.mqtt_client = mqtt.Client()
+                
+                # Define MQTT callbacks
+                self.mqtt_client.on_connect = self._on_mqtt_connect
+                self.mqtt_client.on_message = self._on_mqtt_message
+                
+                # Connect to the broker
+                self.mqtt_client.connect("broker.mqtt.cool", 1883, 60)
+                self.mqtt_client.loop_start()
+                logger.info("Connected to MQTT broker")
+                print("Connected to MQTT broker")
+            except Exception as e:
+                logger.warning(f"Failed to connect to MQTT broker: {e}. Continuing without MQTT.")
+                print(f"Warning: Failed to connect to MQTT broker: {e}. Continuing without MQTT.")
+                self.use_mqtt = False
+                self.mqtt_client = None
 
     def _log_serial_data_to_csv(self, data: dict):
         """Log serial/sensor data to CSV file."""
@@ -328,10 +340,13 @@ class Client:
             logger.error("had an error")
         
         # Disconnect MQTT if enabled
-        if self.use_mqtt:
-            self.mqtt_client.loop_stop()
-            self.mqtt_client.disconnect()
-            logger.info("Disconnected from MQTT broker")
+        if self.use_mqtt and self.mqtt_client is not None:
+            try:
+                self.mqtt_client.loop_stop()
+                self.mqtt_client.disconnect()
+                logger.info("Disconnected from MQTT broker")
+            except Exception as e:
+                logger.warning(f"Error disconnecting from MQTT broker: {e}")
         
         # Stop visualization if enabled - COMMENTED OUT
         # if self.visualizer:
@@ -396,7 +411,20 @@ class Client:
         packet_type = packet[0]
         assert packet_type < 127, f"Packet has error bit set {packet}"
 
-        if packet_type in COMMAND_HANDLERS:
+        # Use instance parsers for multi-packet responses, fall back to COMMAND_HANDLERS
+        if packet_type == hr.CMD_READ_HEART_RATE:
+            result = self.heart_rate_parser.parse(packet)
+            if result is not None:
+                self.queues[packet_type].put_nowait(result)
+            else:
+                logger.debug(f"No result returned from parser for {packet_type} (intermediate packet)")
+        elif packet_type == steps.CMD_GET_STEP_SOMEDAY:
+            result = self.steps_parser.parse(packet)
+            if result is not None:
+                self.queues[packet_type].put_nowait(result)
+            else:
+                logger.debug(f"No result returned from parser for {packet_type} (intermediate packet)")
+        elif packet_type in COMMAND_HANDLERS:
             result = COMMAND_HANDLERS[packet_type](packet)
             if result is not None:
                 self.queues[packet_type].put_nowait(result)
@@ -547,14 +575,72 @@ class Client:
 
         return data
 
-    async def get_heart_rate_log(self, target: datetime | None = None) -> hr.HeartRateLog | hr.NoData:
+    async def get_heart_rate_log(self, target: datetime | None = None, max_retries: int = 3, timeout_per_attempt: float = 60.0) -> hr.HeartRateLog | hr.NoData:
+        """
+        Get heart rate log for a specific date with retry logic and timeout handling.
+        
+        Args:
+            target: Target date (defaults to today)
+            max_retries: Maximum number of retry attempts (default: 3)
+            timeout_per_attempt: Timeout in seconds for each attempt (default: 60 seconds)
+        
+        Returns:
+            HeartRateLog or NoData
+        """
         if target is None:
             target = date_utils.start_of_day(date_utils.now())
-        await self.send_packet(hr.read_heart_rate_packet(target))
-        return await asyncio.wait_for(
-            self.queues[hr.CMD_READ_HEART_RATE].get(),
-            timeout=2,
-        )
+        
+        packet = hr.read_heart_rate_packet(target)
+        last_attempt_time = None
+        
+        for attempt in range(max_retries):
+            # Reset parser state before each attempt
+            if attempt > 0:
+                logger.info(f"Retrying heart rate log request (attempt {attempt + 1}/{max_retries})")
+                self.heart_rate_parser.reset()
+                # Clear any stale data from the queue
+                while not self.queues[hr.CMD_READ_HEART_RATE].empty():
+                    try:
+                        self.queues[hr.CMD_READ_HEART_RATE].get_nowait()
+                    except Exception:
+                        # QueueEmpty or any other exception - just break
+                        break
+            
+            # Send the request
+            await self.send_packet(packet)
+            last_attempt_time = asyncio.get_event_loop().time()
+            
+            try:
+                # Wait for response with longer timeout for multi-packet responses
+                result = await asyncio.wait_for(
+                    self.queues[hr.CMD_READ_HEART_RATE].get(),
+                    timeout=timeout_per_attempt,
+                )
+                logger.info(f"Heart rate log retrieved successfully (attempt {attempt + 1})")
+                return result
+            except asyncio.TimeoutError:
+                elapsed = asyncio.get_event_loop().time() - last_attempt_time
+                logger.warning(
+                    f"Heart rate log request timed out after {elapsed:.1f}s "
+                    f"(attempt {attempt + 1}/{max_retries}). "
+                    f"Ring may have stopped responding."
+                )
+                if attempt < max_retries - 1:
+                    # Wait a bit before retrying
+                    await asyncio.sleep(2)
+                else:
+                    logger.error(
+                        f"Failed to get heart rate log after {max_retries} attempts. "
+                        f"Ring may be unresponsive or turned off."
+                    )
+                    # Reset parser state for next call
+                    self.heart_rate_parser.reset()
+                    # Return NoData to indicate failure
+                    return hr.NoData()
+        
+        # Should not reach here, but just in case
+        self.heart_rate_parser.reset()
+        return hr.NoData()
 
     async def get_heart_rate_log_settings(self) -> hr_settings.HeartRateLogSettings:
         await self.send_packet(hr_settings.READ_HEART_RATE_LOG_SETTINGS_PACKET)
@@ -572,7 +658,19 @@ class Client:
             timeout=2,
         )
 
-    async def get_steps(self, target: datetime, today: datetime | None = None) -> list[steps.SportDetail] | steps.NoData:
+    async def get_steps(self, target: datetime, today: datetime | None = None, max_retries: int = 3, timeout_per_attempt: float = 60.0) -> list[steps.SportDetail] | steps.NoData:
+        """
+        Get step data for a specific date with retry logic and timeout handling.
+        
+        Args:
+            target: Target date
+            today: Reference date for calculating day offset (defaults to now)
+            max_retries: Maximum number of retry attempts (default: 3)
+            timeout_per_attempt: Timeout in seconds for each attempt (default: 60 seconds)
+        
+        Returns:
+            List of SportDetail or NoData
+        """
         if today is None:
             today = datetime.now(timezone.utc)
 
@@ -583,11 +681,57 @@ class Client:
         days = (today.date() - target.date()).days
         logger.debug(f"Looking back {days} days")
 
-        await self.send_packet(steps.read_steps_packet(days))
-        return await asyncio.wait_for(
-            self.queues[steps.CMD_GET_STEP_SOMEDAY].get(),
-            timeout=2,
-        )
+        packet = steps.read_steps_packet(days)
+        last_attempt_time = None
+        
+        for attempt in range(max_retries):
+            # Reset parser state before each attempt
+            if attempt > 0:
+                logger.info(f"Retrying steps request (attempt {attempt + 1}/{max_retries})")
+                self.steps_parser.reset()
+                # Clear any stale data from the queue
+                while not self.queues[steps.CMD_GET_STEP_SOMEDAY].empty():
+                    try:
+                        self.queues[steps.CMD_GET_STEP_SOMEDAY].get_nowait()
+                    except Exception:
+                        # QueueEmpty or any other exception - just break
+                        break
+            
+            # Send the request
+            await self.send_packet(packet)
+            last_attempt_time = asyncio.get_event_loop().time()
+            
+            try:
+                # Wait for response with longer timeout for multi-packet responses
+                result = await asyncio.wait_for(
+                    self.queues[steps.CMD_GET_STEP_SOMEDAY].get(),
+                    timeout=timeout_per_attempt,
+                )
+                logger.info(f"Steps data retrieved successfully (attempt {attempt + 1})")
+                return result
+            except asyncio.TimeoutError:
+                elapsed = asyncio.get_event_loop().time() - last_attempt_time
+                logger.warning(
+                    f"Steps request timed out after {elapsed:.1f}s "
+                    f"(attempt {attempt + 1}/{max_retries}). "
+                    f"Ring may have stopped responding."
+                )
+                if attempt < max_retries - 1:
+                    # Wait a bit before retrying
+                    await asyncio.sleep(2)
+                else:
+                    logger.error(
+                        f"Failed to get steps data after {max_retries} attempts. "
+                        f"Ring may be unresponsive or turned off."
+                    )
+                    # Reset parser state for next call
+                    self.steps_parser.reset()
+                    # Return NoData to indicate failure
+                    return steps.NoData()
+        
+        # Should not reach here, but just in case
+        self.steps_parser.reset()
+        return steps.NoData()
 
     async def reboot(self) -> None:
         await self.send_packet(reboot.REBOOT_PACKET)

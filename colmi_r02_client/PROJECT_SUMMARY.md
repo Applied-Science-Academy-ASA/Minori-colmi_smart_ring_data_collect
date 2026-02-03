@@ -78,7 +78,7 @@ This package provides a Python client for connecting to and communicating with t
 **Initialization Parameters**:
 - `address`: Bluetooth address of the ring
 - `record_to`: Optional path to record packets
-- `use_mqtt`: Enable MQTT publishing (default: True)
+- `use_mqtt`: Enable MQTT publishing (default: True). If connection fails, MQTT is automatically disabled and data collection continues
 - `serial_port`: Serial port name (e.g., "COM4" or "/dev/ttyUSB0"). If None, will auto-detect and prompt user to select
 - `baud_rate`: Serial port baud rate (default: 115200)
 - `use_visualization`: Enable real-time visualization (default: True)
@@ -106,8 +106,14 @@ This package provides a Python client for connecting to and communicating with t
 - `_handle_tx()`: Callback for incoming BLE packets
 - `_on_mqtt_connect()`: MQTT connection callback
 - `_on_mqtt_message()`: MQTT message handler
+- `_log_serial_data_to_csv()`: Log serial/sensor data to CSV file
+- `_log_heartrate_to_csv()`: Log heart rate data to CSV file
 - `_start_visualization()`: Start visualization in main thread
 - `start_visualization_nonblocking()`: Start visualization in background thread
+
+**Error Handling**:
+- MQTT connection failures are handled gracefully - if connection fails (e.g., no WiFi), the client automatically disables MQTT and continues with data collection
+- Serial port connection failures are handled with try-except blocks, allowing the client to continue without serial port if unavailable
 
 **Constants**:
 - `UART_SERVICE_UUID`, `UART_RX_CHAR_UUID`, `UART_TX_CHAR_UUID`: BLE service/characteristic UUIDs
@@ -373,7 +379,9 @@ This package provides a Python client for connecting to and communicating with t
 - Heart rate logs contain 288 readings (5-minute intervals for 24 hours)
 - Step data uses 15-minute intervals (96 intervals per day)
 - Some packet fields are not fully understood (marked with comments)
-- MQTT integration allows publishing sensor data to external systems
+- MQTT integration allows publishing sensor data to external systems, but is optional and gracefully handles connection failures
+- **Offline Operation**: The client works completely offline - all core data collection (BLE communication, serial port, CSV logging, SQLite storage) functions without WiFi or network connectivity
 - Visualization supports 6 sensor types with automatic scaling
 - Serial port communication uses pyserial with automatic port detection
 - If `serial_port` is None during Client initialization, the system will automatically detect and prompt for port selection
+- CSV logging automatically creates timestamped files in the `data/` directory for both serial sensor data and heart rate data
