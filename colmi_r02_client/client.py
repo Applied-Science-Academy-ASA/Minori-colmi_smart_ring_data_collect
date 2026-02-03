@@ -107,6 +107,20 @@ def select_serial_port() -> Optional[str]:
 
 
 class Client:
+    """
+    Client for communicating with Colmi R02 Smart Ring via Bluetooth Low Energy (BLE).
+    
+    Note on WiFi/Bluetooth Interference:
+    Some devices (especially laptops) may experience interference between WiFi and Bluetooth
+    because they both use the 2.4 GHz ISM band and may share antennas or radios. If you
+    experience connection issues, try:
+    1. Disabling WiFi temporarily (if your device allows)
+    2. Using a USB Bluetooth adapter (separate from built-in radio)
+    3. Moving away from WiFi routers or changing WiFi channel
+    4. Using Bluetooth 5.0+ devices which have better coexistence mechanisms
+    
+    The code itself doesn't require WiFi to be disabled - this is a hardware/OS-level issue.
+    """
     def __init__(self, address: str, record_to: Path | None = None, use_mqtt: bool = True, 
                  serial_port: Optional[str] = None, baud_rate: int = 115200,
                  use_visualization: bool = False):  # Disabled by default
@@ -185,22 +199,26 @@ class Client:
         # MQTT setup
         self.use_mqtt = use_mqtt
         self.mqtt_client = None
+        self.mqtt_connected = False
         if use_mqtt:
             try:
                 self.mqtt_client = mqtt.Client()
                 
                 # Define MQTT callbacks
                 self.mqtt_client.on_connect = self._on_mqtt_connect
+                self.mqtt_client.on_disconnect = self._on_mqtt_disconnect
                 self.mqtt_client.on_message = self._on_mqtt_message
                 
-                # Connect to the broker
-                self.mqtt_client.connect("broker.mqtt.cool", 1883, 60)
+                # Use connect_async for non-blocking connection
+                # This won't block initialization even if network is unavailable
+                self.mqtt_client.connect_async("broker.mqtt.cool", 1883, 60)
                 self.mqtt_client.loop_start()
-                logger.info("Connected to MQTT broker")
-                print("Connected to MQTT broker")
+                logger.info("MQTT connection initiated (non-blocking)")
+                # Note: Connection happens asynchronously, actual connection status
+                # will be reported in _on_mqtt_connect callback
             except Exception as e:
-                logger.warning(f"Failed to connect to MQTT broker: {e}. Continuing without MQTT.")
-                print(f"Warning: Failed to connect to MQTT broker: {e}. Continuing without MQTT.")
+                logger.warning(f"Failed to initiate MQTT connection: {e}. Continuing without MQTT.")
+                print(f"Warning: Failed to initiate MQTT connection: {e}. Continuing without MQTT.")
                 self.use_mqtt = False
                 self.mqtt_client = None
 
@@ -257,10 +275,26 @@ class Client:
 
     # MQTT callback for when the client connects to the broker
     def _on_mqtt_connect(self, client, userdata, flags, rc):
-        logger.info(f"Connected to MQTT broker with result code {rc}")
-        # Subscribe to topics (including the blanket sensors topic)
-        client.subscribe("minori-blanket-sensors")
-        logger.info("Subscribed to minori-blanket-sensors topic")
+        if rc == 0:
+            self.mqtt_connected = True
+            logger.info(f"Connected to MQTT broker with result code {rc}")
+            print("Connected to MQTT broker")
+            # Subscribe to topics (including the blanket sensors topic)
+            client.subscribe("minori-blanket-sensors")
+            logger.info("Subscribed to minori-blanket-sensors topic")
+        else:
+            self.mqtt_connected = False
+            logger.warning(f"MQTT connection failed with result code {rc}. Continuing without MQTT.")
+            print(f"Warning: MQTT connection failed (code {rc}). Continuing without MQTT.")
+            self.use_mqtt = False
+    
+    # MQTT callback for when the client disconnects from the broker
+    def _on_mqtt_disconnect(self, client, userdata, rc):
+        self.mqtt_connected = False
+        if rc != 0:
+            logger.warning(f"MQTT broker disconnected unexpectedly (code {rc})")
+        else:
+            logger.info("MQTT broker disconnected normally")
     
     # MQTT callback for when a message is received
     def _on_mqtt_message(self, client, userdata, msg):
@@ -575,13 +609,13 @@ class Client:
 
         return data
 
-    async def get_heart_rate_log(self, target: datetime | None = None, max_retries: int = 3, timeout_per_attempt: float = 60.0) -> hr.HeartRateLog | hr.NoData:
+    async def get_heart_rate_log(self, target: datetime | None = None, timeout_per_attempt: float = 60.0) -> hr.HeartRateLog | hr.NoData:
         """
         Get heart rate log for a specific date with retry logic and timeout handling.
+        Will retry indefinitely until successful or manually interrupted.
         
         Args:
             target: Target date (defaults to today)
-            max_retries: Maximum number of retry attempts (default: 3)
             timeout_per_attempt: Timeout in seconds for each attempt (default: 60 seconds)
         
         Returns:
@@ -591,12 +625,13 @@ class Client:
             target = date_utils.start_of_day(date_utils.now())
         
         packet = hr.read_heart_rate_packet(target)
-        last_attempt_time = None
+        attempt = 0
         
-        for attempt in range(max_retries):
-            # Reset parser state before each attempt
-            if attempt > 0:
-                logger.info(f"Retrying heart rate log request (attempt {attempt + 1}/{max_retries})")
+        while True:
+            attempt += 1
+            # Reset parser state before each attempt (except the first one)
+            if attempt > 1:
+                logger.info(f"Retrying heart rate log request (attempt {attempt})")
                 self.heart_rate_parser.reset()
                 # Clear any stale data from the queue
                 while not self.queues[hr.CMD_READ_HEART_RATE].empty():
@@ -616,31 +651,16 @@ class Client:
                     self.queues[hr.CMD_READ_HEART_RATE].get(),
                     timeout=timeout_per_attempt,
                 )
-                logger.info(f"Heart rate log retrieved successfully (attempt {attempt + 1})")
+                logger.info(f"Heart rate log retrieved successfully (attempt {attempt})")
                 return result
             except asyncio.TimeoutError:
                 elapsed = asyncio.get_event_loop().time() - last_attempt_time
                 logger.warning(
                     f"Heart rate log request timed out after {elapsed:.1f}s "
-                    f"(attempt {attempt + 1}/{max_retries}). "
-                    f"Ring may have stopped responding."
+                    f"(attempt {attempt}). Ring may have stopped responding. Retrying..."
                 )
-                if attempt < max_retries - 1:
-                    # Wait a bit before retrying
-                    await asyncio.sleep(2)
-                else:
-                    logger.error(
-                        f"Failed to get heart rate log after {max_retries} attempts. "
-                        f"Ring may be unresponsive or turned off."
-                    )
-                    # Reset parser state for next call
-                    self.heart_rate_parser.reset()
-                    # Return NoData to indicate failure
-                    return hr.NoData()
-        
-        # Should not reach here, but just in case
-        self.heart_rate_parser.reset()
-        return hr.NoData()
+                # Wait a bit before retrying to avoid spamming the ring
+                await asyncio.sleep(2)
 
     async def get_heart_rate_log_settings(self) -> hr_settings.HeartRateLogSettings:
         await self.send_packet(hr_settings.READ_HEART_RATE_LOG_SETTINGS_PACKET)
@@ -658,14 +678,14 @@ class Client:
             timeout=2,
         )
 
-    async def get_steps(self, target: datetime, today: datetime | None = None, max_retries: int = 3, timeout_per_attempt: float = 60.0) -> list[steps.SportDetail] | steps.NoData:
+    async def get_steps(self, target: datetime, today: datetime | None = None, timeout_per_attempt: float = 60.0) -> list[steps.SportDetail] | steps.NoData:
         """
         Get step data for a specific date with retry logic and timeout handling.
+        Will retry indefinitely until successful or manually interrupted.
         
         Args:
             target: Target date
             today: Reference date for calculating day offset (defaults to now)
-            max_retries: Maximum number of retry attempts (default: 3)
             timeout_per_attempt: Timeout in seconds for each attempt (default: 60 seconds)
         
         Returns:
@@ -682,12 +702,13 @@ class Client:
         logger.debug(f"Looking back {days} days")
 
         packet = steps.read_steps_packet(days)
-        last_attempt_time = None
+        attempt = 0
         
-        for attempt in range(max_retries):
-            # Reset parser state before each attempt
-            if attempt > 0:
-                logger.info(f"Retrying steps request (attempt {attempt + 1}/{max_retries})")
+        while True:
+            attempt += 1
+            # Reset parser state before each attempt (except the first one)
+            if attempt > 1:
+                logger.info(f"Retrying steps request (attempt {attempt})")
                 self.steps_parser.reset()
                 # Clear any stale data from the queue
                 while not self.queues[steps.CMD_GET_STEP_SOMEDAY].empty():
@@ -707,31 +728,16 @@ class Client:
                     self.queues[steps.CMD_GET_STEP_SOMEDAY].get(),
                     timeout=timeout_per_attempt,
                 )
-                logger.info(f"Steps data retrieved successfully (attempt {attempt + 1})")
+                logger.info(f"Steps data retrieved successfully (attempt {attempt})")
                 return result
             except asyncio.TimeoutError:
                 elapsed = asyncio.get_event_loop().time() - last_attempt_time
                 logger.warning(
                     f"Steps request timed out after {elapsed:.1f}s "
-                    f"(attempt {attempt + 1}/{max_retries}). "
-                    f"Ring may have stopped responding."
+                    f"(attempt {attempt}). Ring may have stopped responding. Retrying..."
                 )
-                if attempt < max_retries - 1:
-                    # Wait a bit before retrying
-                    await asyncio.sleep(2)
-                else:
-                    logger.error(
-                        f"Failed to get steps data after {max_retries} attempts. "
-                        f"Ring may be unresponsive or turned off."
-                    )
-                    # Reset parser state for next call
-                    self.steps_parser.reset()
-                    # Return NoData to indicate failure
-                    return steps.NoData()
-        
-        # Should not reach here, but just in case
-        self.steps_parser.reset()
-        return steps.NoData()
+                # Wait a bit before retrying to avoid spamming the ring
+                await asyncio.sleep(2)
 
     async def reboot(self) -> None:
         await self.send_packet(reboot.REBOOT_PACKET)
