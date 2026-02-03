@@ -445,6 +445,16 @@ class Client:
 
     async def __aenter__(self) -> "Client":
         logger.info(f"Connecting to {self.address}")
+        # Disable WiFi before initial connection if WiFi control is enabled
+        if self.control_wifi:
+            logger.info("Disabling WiFi before initial Bluetooth connection...")
+            print("Disabling WiFi before initial Bluetooth connection...")
+            self.wifi_was_enabled = disable_wifi()
+            if self.wifi_was_enabled:
+                # Wait longer for WiFi to fully disable before BT connection
+                logger.info("Waiting for WiFi to fully disable...")
+                await asyncio.sleep(2)
+        
         await self.connect()
         logger.info("Connected!")
         return self
@@ -489,14 +499,15 @@ class Client:
 
     async def connect(self):
         """Connect to the BLE device with retry logic for timeout errors and device not found errors."""
-        # Disable WiFi before connecting if WiFi control is enabled
-        if self.control_wifi:
+        # Disable WiFi before connecting if WiFi control is enabled and not already disabled
+        if self.control_wifi and not self.wifi_was_enabled:
             logger.info("Disabling WiFi before Bluetooth connection...")
             print("Disabling WiFi before Bluetooth connection...")
             self.wifi_was_enabled = disable_wifi()
             if self.wifi_was_enabled:
                 # Give it a moment to fully disable
-                await asyncio.sleep(1)
+                logger.info("Waiting for WiFi to fully disable...")
+                await asyncio.sleep(2)
         
         retry_delay = 2  # Wait 2 seconds between retries
         attempt = 0
@@ -536,12 +547,20 @@ class Client:
 
             await self.bleak_client.start_notify(UART_TX_CHAR_UUID, self._handle_tx)
             
-            # Re-enable WiFi after successful connection if WiFi control is enabled
-            if self.control_wifi and self.wifi_was_enabled:
-                logger.info("Re-enabling WiFi after successful Bluetooth connection...")
-                print("Re-enabling WiFi after successful Bluetooth connection...")
-                await asyncio.sleep(1)  # Give BT connection a moment to stabilize
-                enable_wifi()
+            # Wait a bit for BT connection to fully stabilize
+            await asyncio.sleep(1)
+            
+            # Verify connection is stable before re-enabling WiFi
+            if await self.is_connected():
+                logger.info("Bluetooth connection is stable")
+                # Re-enable WiFi after successful and stable connection if WiFi control is enabled
+                if self.control_wifi and self.wifi_was_enabled:
+                    logger.info("Re-enabling WiFi after successful Bluetooth connection...")
+                    print("Re-enabling WiFi after successful Bluetooth connection...")
+                    await asyncio.sleep(1)  # Give BT connection a bit more time to stabilize
+                    enable_wifi()
+            else:
+                logger.warning("Bluetooth connection not stable, keeping WiFi disabled")
         except Exception as e:
             # If connection fails, re-enable WiFi if we disabled it
             if self.control_wifi and self.wifi_was_enabled:
@@ -638,8 +657,19 @@ class Client:
         # Recreate the client
         self.bleak_client = BleakClient(self.address)
         
-        # Connect fresh
-        await self.connect()
+        # If WiFi control is enabled, disable WiFi again before reconnecting
+        # (preserve the original state so we know whether to re-enable it)
+        if self.control_wifi:
+            # Temporarily reset wifi_was_enabled so connect() will disable WiFi
+            original_wifi_state = self.wifi_was_enabled
+            self.wifi_was_enabled = False
+            # Connect fresh (this will disable WiFi if needed)
+            await self.connect()
+            # Restore original state so WiFi gets re-enabled if it was originally enabled
+            self.wifi_was_enabled = original_wifi_state
+        else:
+            # Connect fresh without WiFi control
+            await self.connect()
     
     async def ensure_connected(self) -> None:
         """Ensure the BLE connection is alive, reconnect if needed."""
