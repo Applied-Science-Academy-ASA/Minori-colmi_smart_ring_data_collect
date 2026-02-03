@@ -438,39 +438,67 @@ class Client:
 
     def _handle_tx(self, _: BleakGATTCharacteristic, packet: bytearray) -> None:
         """Bleak callback that handles new packets from the ring."""
+        try:
+            logger.info(f"Received packet {packet}")
 
-        logger.info(f"Received packet {packet}")
-
-        assert len(packet) == 16, f"Packet is the wrong length {packet}"
-        packet_type = packet[0]
-        assert packet_type < 127, f"Packet has error bit set {packet}"
-
-        # Use instance parsers for multi-packet responses, fall back to COMMAND_HANDLERS
-        if packet_type == hr.CMD_READ_HEART_RATE:
-            result = self.heart_rate_parser.parse(packet)
-            if result is not None:
-                self.queues[packet_type].put_nowait(result)
+            # Validate packet length
+            if len(packet) != 16:
+                logger.error(f"Packet is the wrong length {len(packet)} (expected 16): {packet}")
+                return
+            
+            packet_type = packet[0]
+            
+            # Check for error bit (packet_type >= 127 indicates error)
+            if packet_type >= 127:
+                logger.warning(f"Packet has error bit set: {packet}")
+                # Don't return early - still try to process it, but log the warning
+            
+            # Use instance parsers for multi-packet responses, fall back to COMMAND_HANDLERS
+            if packet_type == hr.CMD_READ_HEART_RATE:
+                try:
+                    result = self.heart_rate_parser.parse(packet)
+                    if result is not None:
+                        self.queues[packet_type].put_nowait(result)
+                    else:
+                        logger.debug(f"No result returned from parser for {packet_type} (intermediate packet)")
+                except Exception as e:
+                    logger.error(f"Error parsing heart rate packet: {e}", exc_info=True)
+                    # Reset parser on error to prevent stuck state
+                    self.heart_rate_parser.reset()
+            elif packet_type == steps.CMD_GET_STEP_SOMEDAY:
+                try:
+                    result = self.steps_parser.parse(packet)
+                    if result is not None:
+                        self.queues[packet_type].put_nowait(result)
+                    else:
+                        logger.debug(f"No result returned from parser for {packet_type} (intermediate packet)")
+                except Exception as e:
+                    logger.error(f"Error parsing steps packet: {e}", exc_info=True)
+                    # Reset parser on error to prevent stuck state
+                    self.steps_parser.reset()
+            elif packet_type in COMMAND_HANDLERS:
+                try:
+                    result = COMMAND_HANDLERS[packet_type](packet)
+                    if result is not None:
+                        self.queues[packet_type].put_nowait(result)
+                    else:
+                        logger.debug(f"No result returned from parser for {packet_type}")
+                except Exception as e:
+                    logger.error(f"Error parsing packet type {packet_type}: {e}", exc_info=True)
             else:
-                logger.debug(f"No result returned from parser for {packet_type} (intermediate packet)")
-        elif packet_type == steps.CMD_GET_STEP_SOMEDAY:
-            result = self.steps_parser.parse(packet)
-            if result is not None:
-                self.queues[packet_type].put_nowait(result)
-            else:
-                logger.debug(f"No result returned from parser for {packet_type} (intermediate packet)")
-        elif packet_type in COMMAND_HANDLERS:
-            result = COMMAND_HANDLERS[packet_type](packet)
-            if result is not None:
-                self.queues[packet_type].put_nowait(result)
-            else:
-                logger.debug(f"No result returned from parser for {packet_type}")
-        else:
-            logger.warning(f"Did not expect this packet: {packet}")
+                logger.warning(f"Did not expect this packet: {packet} (type: 0x{packet_type:02x}, {packet_type})")
+                # Don't crash - just log and continue
 
-        if self.record_to is not None:
-            with self.record_to.open("ab") as f:
-                f.write(packet)
-                f.write(b"\n")
+            if self.record_to is not None:
+                try:
+                    with self.record_to.open("ab") as f:
+                        f.write(packet)
+                        f.write(b"\n")
+                except Exception as e:
+                    logger.error(f"Error recording packet: {e}")
+        except Exception as e:
+            # Catch any unexpected exceptions to prevent crashing the callback
+            logger.error(f"Unexpected error in _handle_tx: {e}", exc_info=True)
 
     async def send_packet(self, packet: bytearray) -> None:
         logger.debug(f"Sending packet: {packet}")
@@ -628,38 +656,56 @@ class Client:
         attempt = 0
         
         while True:
-            attempt += 1
-            # Reset parser state before each attempt (except the first one)
-            if attempt > 1:
-                logger.info(f"Retrying heart rate log request (attempt {attempt})")
-                self.heart_rate_parser.reset()
-                # Clear any stale data from the queue
-                while not self.queues[hr.CMD_READ_HEART_RATE].empty():
-                    try:
-                        self.queues[hr.CMD_READ_HEART_RATE].get_nowait()
-                    except Exception:
-                        # QueueEmpty or any other exception - just break
-                        break
-            
-            # Send the request
-            await self.send_packet(packet)
-            last_attempt_time = asyncio.get_event_loop().time()
-            
             try:
-                # Wait for response with longer timeout for multi-packet responses
-                result = await asyncio.wait_for(
-                    self.queues[hr.CMD_READ_HEART_RATE].get(),
-                    timeout=timeout_per_attempt,
-                )
-                logger.info(f"Heart rate log retrieved successfully (attempt {attempt})")
-                return result
-            except asyncio.TimeoutError:
-                elapsed = asyncio.get_event_loop().time() - last_attempt_time
-                logger.warning(
-                    f"Heart rate log request timed out after {elapsed:.1f}s "
-                    f"(attempt {attempt}). Ring may have stopped responding. Retrying..."
-                )
-                # Wait a bit before retrying to avoid spamming the ring
+                attempt += 1
+                # Reset parser state before each attempt (except the first one)
+                if attempt > 1:
+                    logger.info(f"Retrying heart rate log request (attempt {attempt})")
+                    self.heart_rate_parser.reset()
+                    # Clear any stale data from the queue
+                    while not self.queues[hr.CMD_READ_HEART_RATE].empty():
+                        try:
+                            self.queues[hr.CMD_READ_HEART_RATE].get_nowait()
+                        except Exception:
+                            # QueueEmpty or any other exception - just break
+                            break
+                
+                # Send the request
+                await self.send_packet(packet)
+                last_attempt_time = asyncio.get_event_loop().time()
+                
+                try:
+                    # Wait for response with longer timeout for multi-packet responses
+                    result = await asyncio.wait_for(
+                        self.queues[hr.CMD_READ_HEART_RATE].get(),
+                        timeout=timeout_per_attempt,
+                    )
+                    logger.info(f"Heart rate log retrieved successfully (attempt {attempt})")
+                    return result
+                except asyncio.TimeoutError:
+                    elapsed = asyncio.get_event_loop().time() - last_attempt_time
+                    logger.warning(
+                        f"Heart rate log request timed out after {elapsed:.1f}s "
+                        f"(attempt {attempt}). Ring may have stopped responding. Retrying..."
+                    )
+                    # Wait a bit before retrying to avoid spamming the ring
+                    await asyncio.sleep(2)
+                except Exception as e:
+                    # Catch any other exceptions (e.g., connection errors) and retry
+                    logger.error(f"Error during heart rate log request (attempt {attempt}): {e}", exc_info=True)
+                    logger.info("Retrying after error...")
+                    self.heart_rate_parser.reset()
+                    await asyncio.sleep(2)
+            except KeyboardInterrupt:
+                # Allow manual interruption
+                logger.info("Heart rate log request interrupted by user")
+                self.heart_rate_parser.reset()
+                raise
+            except Exception as e:
+                # Catch any unexpected exceptions in the retry loop itself
+                logger.error(f"Unexpected error in retry loop: {e}", exc_info=True)
+                logger.info("Retrying after unexpected error...")
+                self.heart_rate_parser.reset()
                 await asyncio.sleep(2)
 
     async def get_heart_rate_log_settings(self) -> hr_settings.HeartRateLogSettings:
@@ -705,38 +751,56 @@ class Client:
         attempt = 0
         
         while True:
-            attempt += 1
-            # Reset parser state before each attempt (except the first one)
-            if attempt > 1:
-                logger.info(f"Retrying steps request (attempt {attempt})")
-                self.steps_parser.reset()
-                # Clear any stale data from the queue
-                while not self.queues[steps.CMD_GET_STEP_SOMEDAY].empty():
-                    try:
-                        self.queues[steps.CMD_GET_STEP_SOMEDAY].get_nowait()
-                    except Exception:
-                        # QueueEmpty or any other exception - just break
-                        break
-            
-            # Send the request
-            await self.send_packet(packet)
-            last_attempt_time = asyncio.get_event_loop().time()
-            
             try:
-                # Wait for response with longer timeout for multi-packet responses
-                result = await asyncio.wait_for(
-                    self.queues[steps.CMD_GET_STEP_SOMEDAY].get(),
-                    timeout=timeout_per_attempt,
-                )
-                logger.info(f"Steps data retrieved successfully (attempt {attempt})")
-                return result
-            except asyncio.TimeoutError:
-                elapsed = asyncio.get_event_loop().time() - last_attempt_time
-                logger.warning(
-                    f"Steps request timed out after {elapsed:.1f}s "
-                    f"(attempt {attempt}). Ring may have stopped responding. Retrying..."
-                )
-                # Wait a bit before retrying to avoid spamming the ring
+                attempt += 1
+                # Reset parser state before each attempt (except the first one)
+                if attempt > 1:
+                    logger.info(f"Retrying steps request (attempt {attempt})")
+                    self.steps_parser.reset()
+                    # Clear any stale data from the queue
+                    while not self.queues[steps.CMD_GET_STEP_SOMEDAY].empty():
+                        try:
+                            self.queues[steps.CMD_GET_STEP_SOMEDAY].get_nowait()
+                        except Exception:
+                            # QueueEmpty or any other exception - just break
+                            break
+                
+                # Send the request
+                await self.send_packet(packet)
+                last_attempt_time = asyncio.get_event_loop().time()
+                
+                try:
+                    # Wait for response with longer timeout for multi-packet responses
+                    result = await asyncio.wait_for(
+                        self.queues[steps.CMD_GET_STEP_SOMEDAY].get(),
+                        timeout=timeout_per_attempt,
+                    )
+                    logger.info(f"Steps data retrieved successfully (attempt {attempt})")
+                    return result
+                except asyncio.TimeoutError:
+                    elapsed = asyncio.get_event_loop().time() - last_attempt_time
+                    logger.warning(
+                        f"Steps request timed out after {elapsed:.1f}s "
+                        f"(attempt {attempt}). Ring may have stopped responding. Retrying..."
+                    )
+                    # Wait a bit before retrying to avoid spamming the ring
+                    await asyncio.sleep(2)
+                except Exception as e:
+                    # Catch any other exceptions (e.g., connection errors) and retry
+                    logger.error(f"Error during steps request (attempt {attempt}): {e}", exc_info=True)
+                    logger.info("Retrying after error...")
+                    self.steps_parser.reset()
+                    await asyncio.sleep(2)
+            except KeyboardInterrupt:
+                # Allow manual interruption
+                logger.info("Steps request interrupted by user")
+                self.steps_parser.reset()
+                raise
+            except Exception as e:
+                # Catch any unexpected exceptions in the retry loop itself
+                logger.error(f"Unexpected error in retry loop: {e}", exc_info=True)
+                logger.info("Retrying after unexpected error...")
+                self.steps_parser.reset()
                 await asyncio.sleep(2)
 
     async def reboot(self) -> None:
