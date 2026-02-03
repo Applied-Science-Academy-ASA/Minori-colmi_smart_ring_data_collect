@@ -500,13 +500,58 @@ class Client:
             # Catch any unexpected exceptions to prevent crashing the callback
             logger.error(f"Unexpected error in _handle_tx: {e}", exc_info=True)
 
+    async def is_connected(self) -> bool:
+        """Check if the BLE connection is still alive."""
+        try:
+            return self.bleak_client.is_connected
+        except Exception:
+            return False
+    
+    async def ensure_connected(self) -> None:
+        """Ensure the BLE connection is alive, reconnect if needed."""
+        if not await self.is_connected():
+            logger.warning("BLE connection lost, attempting to reconnect...")
+            print("BLE connection lost, attempting to reconnect...")
+            try:
+                # Disconnect first if needed (in case of stale connection state)
+                try:
+                    if self.bleak_client.is_connected:
+                        await self.bleak_client.disconnect()
+                except Exception:
+                    pass  # Ignore disconnect errors
+                
+                # Recreate the client
+                self.bleak_client = BleakClient(self.address)
+                
+                # Connect
+                await self.connect()
+                logger.info("Reconnected successfully")
+                print("Reconnected successfully")
+            except Exception as e:
+                logger.error(f"Failed to reconnect: {e}")
+                # Don't raise - let the retry loop handle it
+                raise
+
     async def send_packet(self, packet: bytearray) -> None:
         logger.debug(f"Sending packet: {packet}")
         logger.debug(f"Packet type: {packet[0]}")
         print(f"Sending packet: {packet}")
         print(f"Packet type: {packet[0]}")
 
-        await self.bleak_client.write_gatt_char(self.rx_char, packet, response=False)
+        # Ensure connection is alive before sending
+        await self.ensure_connected()
+        
+        try:
+            await self.bleak_client.write_gatt_char(self.rx_char, packet, response=False)
+        except (BleakError, Exception) as e:
+            logger.error(f"Error sending packet: {e}")
+            # Try to reconnect and resend once
+            try:
+                await self.ensure_connected()
+                await self.bleak_client.write_gatt_char(self.rx_char, packet, response=False)
+            except Exception as e2:
+                logger.error(f"Failed to resend packet after reconnect: {e2}")
+                raise
 
     async def get_battery(self) -> battery.BatteryInfo:
         await self.send_packet(battery.BATTERY_PACKET)
@@ -658,6 +703,9 @@ class Client:
         while True:
             try:
                 attempt += 1
+                # Ensure connection is alive before each attempt
+                await self.ensure_connected()
+                
                 # Reset parser state before each attempt (except the first one)
                 if attempt > 1:
                     logger.info(f"Retrying heart rate log request (attempt {attempt})")
@@ -673,21 +721,56 @@ class Client:
                 # Send the request
                 await self.send_packet(packet)
                 last_attempt_time = asyncio.get_event_loop().time()
+                last_packet_time = last_attempt_time
                 
                 try:
-                    # Wait for response with longer timeout for multi-packet responses
-                    result = await asyncio.wait_for(
-                        self.queues[hr.CMD_READ_HEART_RATE].get(),
-                        timeout=timeout_per_attempt,
-                    )
-                    logger.info(f"Heart rate log retrieved successfully (attempt {attempt})")
-                    return result
+                    # Wait for response with periodic connection checks
+                    # Use shorter timeout chunks to check connection health
+                    chunk_timeout = min(10.0, timeout_per_attempt / 6)  # Check every 10s or 1/6 of total timeout
+                    elapsed = 0.0
+                    
+                    while elapsed < timeout_per_attempt:
+                        try:
+                            # Wait for response with chunk timeout
+                            remaining_time = timeout_per_attempt - elapsed
+                            chunk = min(chunk_timeout, remaining_time)
+                            
+                            result = await asyncio.wait_for(
+                                self.queues[hr.CMD_READ_HEART_RATE].get(),
+                                timeout=chunk,
+                            )
+                            logger.info(f"Heart rate log retrieved successfully (attempt {attempt})")
+                            return result
+                        except asyncio.TimeoutError:
+                            elapsed = asyncio.get_event_loop().time() - last_attempt_time
+                            
+                            # Check connection health periodically
+                            if not await self.is_connected():
+                                logger.warning(f"Connection lost during wait (after {elapsed:.1f}s). Reconnecting...")
+                                await self.ensure_connected()
+                                # Break to retry the request
+                                break
+                            
+                            # Log progress every 20 seconds
+                            if int(elapsed) % 20 == 0 and elapsed > 0:
+                                logger.info(f"Still waiting for heart rate log response... ({elapsed:.1f}s / {timeout_per_attempt:.1f}s)")
+                            
+                            # Continue waiting if we haven't hit the total timeout
+                            if elapsed >= timeout_per_attempt:
+                                raise asyncio.TimeoutError()
+                    
+                    # If we get here, we've hit the timeout
+                    raise asyncio.TimeoutError()
+                    
                 except asyncio.TimeoutError:
                     elapsed = asyncio.get_event_loop().time() - last_attempt_time
                     logger.warning(
                         f"Heart rate log request timed out after {elapsed:.1f}s "
                         f"(attempt {attempt}). Ring may have stopped responding. Retrying..."
                     )
+                    # Check connection before retrying
+                    if not await self.is_connected():
+                        logger.warning("Connection lost, will reconnect on next attempt")
                     # Wait a bit before retrying to avoid spamming the ring
                     await asyncio.sleep(2)
                 except Exception as e:
@@ -695,6 +778,9 @@ class Client:
                     logger.error(f"Error during heart rate log request (attempt {attempt}): {e}", exc_info=True)
                     logger.info("Retrying after error...")
                     self.heart_rate_parser.reset()
+                    # Check and reconnect if needed
+                    if not await self.is_connected():
+                        logger.warning("Connection lost, will reconnect on next attempt")
                     await asyncio.sleep(2)
             except KeyboardInterrupt:
                 # Allow manual interruption
@@ -753,6 +839,9 @@ class Client:
         while True:
             try:
                 attempt += 1
+                # Ensure connection is alive before each attempt
+                await self.ensure_connected()
+                
                 # Reset parser state before each attempt (except the first one)
                 if attempt > 1:
                     logger.info(f"Retrying steps request (attempt {attempt})")
@@ -770,19 +859,53 @@ class Client:
                 last_attempt_time = asyncio.get_event_loop().time()
                 
                 try:
-                    # Wait for response with longer timeout for multi-packet responses
-                    result = await asyncio.wait_for(
-                        self.queues[steps.CMD_GET_STEP_SOMEDAY].get(),
-                        timeout=timeout_per_attempt,
-                    )
-                    logger.info(f"Steps data retrieved successfully (attempt {attempt})")
-                    return result
+                    # Wait for response with periodic connection checks
+                    # Use shorter timeout chunks to check connection health
+                    chunk_timeout = min(10.0, timeout_per_attempt / 6)  # Check every 10s or 1/6 of total timeout
+                    elapsed = 0.0
+                    
+                    while elapsed < timeout_per_attempt:
+                        try:
+                            # Wait for response with chunk timeout
+                            remaining_time = timeout_per_attempt - elapsed
+                            chunk = min(chunk_timeout, remaining_time)
+                            
+                            result = await asyncio.wait_for(
+                                self.queues[steps.CMD_GET_STEP_SOMEDAY].get(),
+                                timeout=chunk,
+                            )
+                            logger.info(f"Steps data retrieved successfully (attempt {attempt})")
+                            return result
+                        except asyncio.TimeoutError:
+                            elapsed = asyncio.get_event_loop().time() - last_attempt_time
+                            
+                            # Check connection health periodically
+                            if not await self.is_connected():
+                                logger.warning(f"Connection lost during wait (after {elapsed:.1f}s). Reconnecting...")
+                                await self.ensure_connected()
+                                # Break to retry the request
+                                break
+                            
+                            # Log progress every 20 seconds
+                            if int(elapsed) % 20 == 0 and elapsed > 0:
+                                logger.info(f"Still waiting for steps response... ({elapsed:.1f}s / {timeout_per_attempt:.1f}s)")
+                            
+                            # Continue waiting if we haven't hit the total timeout
+                            if elapsed >= timeout_per_attempt:
+                                raise asyncio.TimeoutError()
+                    
+                    # If we get here, we've hit the timeout
+                    raise asyncio.TimeoutError()
+                    
                 except asyncio.TimeoutError:
                     elapsed = asyncio.get_event_loop().time() - last_attempt_time
                     logger.warning(
                         f"Steps request timed out after {elapsed:.1f}s "
                         f"(attempt {attempt}). Ring may have stopped responding. Retrying..."
                     )
+                    # Check connection before retrying
+                    if not await self.is_connected():
+                        logger.warning("Connection lost, will reconnect on next attempt")
                     # Wait a bit before retrying to avoid spamming the ring
                     await asyncio.sleep(2)
                 except Exception as e:
@@ -790,6 +913,9 @@ class Client:
                     logger.error(f"Error during steps request (attempt {attempt}): {e}", exc_info=True)
                     logger.info("Retrying after error...")
                     self.steps_parser.reset()
+                    # Check and reconnect if needed
+                    if not await self.is_connected():
+                        logger.warning("Connection lost, will reconnect on next attempt")
                     await asyncio.sleep(2)
             except KeyboardInterrupt:
                 # Allow manual interruption
