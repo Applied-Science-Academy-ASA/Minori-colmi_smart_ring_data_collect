@@ -11,6 +11,8 @@ import sys
 import threading
 import time
 import csv
+import subprocess
+import platform
 
 from bleak import BleakClient
 from bleak.backends.characteristic import BleakGATTCharacteristic
@@ -70,6 +72,88 @@ multi packet messages where the parser has state
 """
 
 
+def disable_wifi() -> bool:
+    """
+    Disable WiFi on Raspberry Pi using nmcli or system commands.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        # Try nmcli first (NetworkManager)
+        result = subprocess.run(
+            ["nmcli", "radio", "wifi", "off"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            logger.info("WiFi disabled using nmcli")
+            return True
+        
+        # Try rfkill as fallback
+        result = subprocess.run(
+            ["rfkill", "block", "wifi"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            logger.info("WiFi disabled using rfkill")
+            return True
+        
+        logger.warning("Failed to disable WiFi - neither nmcli nor rfkill worked")
+        return False
+    except FileNotFoundError:
+        logger.warning("WiFi control commands not found (nmcli/rfkill). WiFi control disabled.")
+        return False
+    except subprocess.TimeoutExpired:
+        logger.warning("WiFi disable command timed out")
+        return False
+    except Exception as e:
+        logger.warning(f"Error disabling WiFi: {e}")
+        return False
+
+
+def enable_wifi() -> bool:
+    """
+    Enable WiFi on Raspberry Pi using nmcli or system commands.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        # Try nmcli first (NetworkManager)
+        result = subprocess.run(
+            ["nmcli", "radio", "wifi", "on"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            logger.info("WiFi enabled using nmcli")
+            return True
+        
+        # Try rfkill as fallback
+        result = subprocess.run(
+            ["rfkill", "unblock", "wifi"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            logger.info("WiFi enabled using rfkill")
+            return True
+        
+        logger.warning("Failed to enable WiFi - neither nmcli nor rfkill worked")
+        return False
+    except FileNotFoundError:
+        logger.warning("WiFi control commands not found (nmcli/rfkill). WiFi control disabled.")
+        return False
+    except subprocess.TimeoutExpired:
+        logger.warning("WiFi enable command timed out")
+        return False
+    except Exception as e:
+        logger.warning(f"Error enabling WiFi: {e}")
+        return False
+
+
 def select_serial_port() -> Optional[str]:
     """
     Automatically detect available serial ports and prompt user to select one.
@@ -123,11 +207,13 @@ class Client:
     """
     def __init__(self, address: str, record_to: Path | None = None, use_mqtt: bool = True, 
                  serial_port: Optional[str] = None, baud_rate: int = 115200,
-                 use_visualization: bool = False):  # Disabled by default
+                 use_visualization: bool = False, control_wifi: bool = False):  # Disabled by default
         self.address = address
         self.bleak_client = BleakClient(self.address)
         self.queues: dict[int, asyncio.Queue] = {cmd: asyncio.Queue() for cmd in COMMAND_HANDLERS}
         self.record_to = record_to
+        self.control_wifi = control_wifi
+        self.wifi_was_enabled = False  # Track if WiFi was enabled before we disabled it
         
         # Track the latest heart rate reading
         self.latest_heart_rate = None
@@ -391,47 +477,77 @@ class Client:
         if self.serial_conn and self.serial_conn.is_open:
             self.serial_conn.close()
             logger.info("Closed serial port connection")
-            
+        
+        # Disconnect Bluetooth
         await self.disconnect()
+        
+        # Re-enable WiFi if we disabled it and WiFi control is enabled
+        if self.control_wifi and self.wifi_was_enabled:
+            logger.info("Re-enabling WiFi after disconnection...")
+            print("Re-enabling WiFi after disconnection...")
+            enable_wifi()
 
     async def connect(self):
         """Connect to the BLE device with retry logic for timeout errors and device not found errors."""
+        # Disable WiFi before connecting if WiFi control is enabled
+        if self.control_wifi:
+            logger.info("Disabling WiFi before Bluetooth connection...")
+            print("Disabling WiFi before Bluetooth connection...")
+            self.wifi_was_enabled = disable_wifi()
+            if self.wifi_was_enabled:
+                # Give it a moment to fully disable
+                await asyncio.sleep(1)
+        
         retry_delay = 2  # Wait 2 seconds between retries
         attempt = 0
         
-        while True:
-            attempt += 1
-            try:
-                await self.bleak_client.connect()
-                logger.info(f"Successfully connected to {self.address} after {attempt} attempt(s)")
-                print(f"Successfully connected to {self.address} after {attempt} attempt(s)")
-                break
-            except (TimeoutError, asyncio.TimeoutError, asyncio.CancelledError) as e:
-                logger.warning(f"Connection timeout (attempt {attempt}), retrying in {retry_delay} seconds...")
-                print(f"Connection timeout, retrying in {retry_delay} seconds... (attempt {attempt})")
-                await asyncio.sleep(retry_delay)
-                # Recreate the client if it was cancelled
-                if isinstance(e, asyncio.CancelledError):
+        try:
+            while True:
+                attempt += 1
+                try:
+                    await self.bleak_client.connect()
+                    logger.info(f"Successfully connected to {self.address} after {attempt} attempt(s)")
+                    print(f"Successfully connected to {self.address} after {attempt} attempt(s)")
+                    break
+                except (TimeoutError, asyncio.TimeoutError, asyncio.CancelledError) as e:
+                    logger.warning(f"Connection timeout (attempt {attempt}), retrying in {retry_delay} seconds...")
+                    print(f"Connection timeout, retrying in {retry_delay} seconds... (attempt {attempt})")
+                    await asyncio.sleep(retry_delay)
+                    # Recreate the client if it was cancelled
+                    if isinstance(e, asyncio.CancelledError):
+                        self.bleak_client = BleakClient(self.address)
+                except BleakError as e:
+                    # Retry on BleakError (e.g., device not found)
+                    logger.warning(f"Connection error (attempt {attempt}): {e}, retrying in {retry_delay} seconds...")
+                    print(f"Connection error, retrying in {retry_delay} seconds... (attempt {attempt})")
+                    await asyncio.sleep(retry_delay)
+                    # Recreate the client to reset the connection state
                     self.bleak_client = BleakClient(self.address)
-            except BleakError as e:
-                # Retry on BleakError (e.g., device not found)
-                logger.warning(f"Connection error (attempt {attempt}): {e}, retrying in {retry_delay} seconds...")
-                print(f"Connection error, retrying in {retry_delay} seconds... (attempt {attempt})")
-                await asyncio.sleep(retry_delay)
-                # Recreate the client to reset the connection state
-                self.bleak_client = BleakClient(self.address)
-            except Exception as e:
-                # For other exceptions, log and re-raise
-                logger.error(f"Connection error: {e}")
-                raise
+                except Exception as e:
+                    # For other exceptions, log and re-raise
+                    logger.error(f"Connection error: {e}")
+                    raise
 
-        nrf_uart_service = self.bleak_client.services.get_service(UART_SERVICE_UUID)
-        assert nrf_uart_service
-        rx_char = nrf_uart_service.get_characteristic(UART_RX_CHAR_UUID)
-        assert rx_char
-        self.rx_char = rx_char
+            nrf_uart_service = self.bleak_client.services.get_service(UART_SERVICE_UUID)
+            assert nrf_uart_service
+            rx_char = nrf_uart_service.get_characteristic(UART_RX_CHAR_UUID)
+            assert rx_char
+            self.rx_char = rx_char
 
-        await self.bleak_client.start_notify(UART_TX_CHAR_UUID, self._handle_tx)
+            await self.bleak_client.start_notify(UART_TX_CHAR_UUID, self._handle_tx)
+            
+            # Re-enable WiFi after successful connection if WiFi control is enabled
+            if self.control_wifi and self.wifi_was_enabled:
+                logger.info("Re-enabling WiFi after successful Bluetooth connection...")
+                print("Re-enabling WiFi after successful Bluetooth connection...")
+                await asyncio.sleep(1)  # Give BT connection a moment to stabilize
+                enable_wifi()
+        except Exception as e:
+            # If connection fails, re-enable WiFi if we disabled it
+            if self.control_wifi and self.wifi_was_enabled:
+                logger.warning("Connection failed, re-enabling WiFi...")
+                enable_wifi()
+            raise
 
     async def disconnect(self):
         await self.bleak_client.disconnect()
@@ -507,30 +623,30 @@ class Client:
         except Exception:
             return False
     
+    async def force_reconnect(self) -> None:
+        """Force disconnect and reconnect - always start fresh."""
+        logger.info("Forcing disconnect and reconnect...")
+        print("Forcing disconnect and reconnect...")
+        
+        # Disconnect first
+        try:
+            if await self.is_connected():
+                await self.disconnect()
+        except Exception as e:
+            logger.debug(f"Error during disconnect: {e}")
+        
+        # Recreate the client
+        self.bleak_client = BleakClient(self.address)
+        
+        # Connect fresh
+        await self.connect()
+    
     async def ensure_connected(self) -> None:
         """Ensure the BLE connection is alive, reconnect if needed."""
         if not await self.is_connected():
             logger.warning("BLE connection lost, attempting to reconnect...")
             print("BLE connection lost, attempting to reconnect...")
-            try:
-                # Disconnect first if needed (in case of stale connection state)
-                try:
-                    if self.bleak_client.is_connected:
-                        await self.bleak_client.disconnect()
-                except Exception:
-                    pass  # Ignore disconnect errors
-                
-                # Recreate the client
-                self.bleak_client = BleakClient(self.address)
-                
-                # Connect
-                await self.connect()
-                logger.info("Reconnected successfully")
-                print("Reconnected successfully")
-            except Exception as e:
-                logger.error(f"Failed to reconnect: {e}")
-                # Don't raise - let the retry loop handle it
-                raise
+            await self.force_reconnect()
 
     async def send_packet(self, packet: bytearray) -> None:
         logger.debug(f"Sending packet: {packet}")
@@ -766,11 +882,14 @@ class Client:
                     elapsed = asyncio.get_event_loop().time() - last_attempt_time
                     logger.warning(
                         f"Heart rate log request timed out after {elapsed:.1f}s "
-                        f"(attempt {attempt}). Ring may have stopped responding. Retrying..."
+                        f"(attempt {attempt}). Ring may have stopped responding. "
+                        f"Force disconnecting and reconnecting..."
                     )
-                    # Check connection before retrying
-                    if not await self.is_connected():
-                        logger.warning("Connection lost, will reconnect on next attempt")
+                    # ALWAYS force disconnect and reconnect on timeout
+                    try:
+                        await self.force_reconnect()
+                    except Exception as e:
+                        logger.error(f"Error during force reconnect: {e}")
                     # Wait a bit before retrying to avoid spamming the ring
                     await asyncio.sleep(2)
                 except Exception as e:
@@ -901,11 +1020,14 @@ class Client:
                     elapsed = asyncio.get_event_loop().time() - last_attempt_time
                     logger.warning(
                         f"Steps request timed out after {elapsed:.1f}s "
-                        f"(attempt {attempt}). Ring may have stopped responding. Retrying..."
+                        f"(attempt {attempt}). Ring may have stopped responding. "
+                        f"Force disconnecting and reconnecting..."
                     )
-                    # Check connection before retrying
-                    if not await self.is_connected():
-                        logger.warning("Connection lost, will reconnect on next attempt")
+                    # ALWAYS force disconnect and reconnect on timeout
+                    try:
+                        await self.force_reconnect()
+                    except Exception as e:
+                        logger.error(f"Error during force reconnect: {e}")
                     # Wait a bit before retrying to avoid spamming the ring
                     await asyncio.sleep(2)
                 except Exception as e:
