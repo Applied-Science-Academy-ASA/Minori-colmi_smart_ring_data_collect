@@ -1,4 +1,5 @@
 captures/*.bin
+data/
 *.sqlite
 .hypothesis
 dist/
